@@ -292,7 +292,7 @@ public:
   using DeviceT::tx_forever;
   using DeviceT::tx;
 
-  Master() : DeviceT() {
+  Master(const Pins &pins) : DeviceT(pins) {
       master_timer = TimerType(
           0, 1000000,
           [](Timer *, void *data) {
@@ -433,8 +433,8 @@ public:
   using DeviceT::tx;
   using DeviceT::io;
 
-  Slave()
-      : Device<TimerType, SemaphoreType, TimeType, IOType, QueueType, max_concurrent_requests>() {}
+  Slave(const Pins &pins)
+      : Device<TimerType, SemaphoreType, TimeType, IOType, QueueType, max_concurrent_requests>(pins) {}
   virtual ~Slave() = default;
 
   virtual void start() override {}

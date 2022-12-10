@@ -1,0 +1,131 @@
+#include <stdio.h>
+#include <stdarg.h>
+#include <limits.h>
+
+#include "FreeRTOSConfig.h"
+
+#include <Arduino_FreeRTOS.h>
+#include <task.h>
+#include <timers.h>
+#include <semphr.h>
+
+#include "opentherm/transport.h"
+
+#include "arduino_data_structures.h"
+#include "arduino_opentherm_io.h"
+
+using namespace OpenTherm;
+
+static const unsigned master_in = 2, master_out = 4;
+static const unsigned slave_in = 3, slave_out = 5;
+
+static FILE uartf = {0};
+static SemaphoreHandle_t log_mtx = NULL;
+static StaticSemaphore_t log_mtx_state;
+
+static int uart_putchar(char c, FILE *stream)
+{
+  Serial.write(c);
+  return 0;
+}
+
+void vlog(const char *fmt, va_list args) {
+  if (log_mtx)
+    xSemaphoreTake(log_mtx, portMAX_DELAY);
+  printf("[%010lu] ", micros());
+  vprintf(fmt, args);
+  printf("\n");
+  fflush(stdout);
+  if (log_mtx)
+    xSemaphoreGive(log_mtx);
+}
+
+void log(const char *fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  vlog(fmt, args);
+  va_end(args);
+}
+
+class Listener : public Device<ArduinoTimer, ArduinoSemaphore, ArduinoTime, ArduinoIO, ArduinoQueue, 2>
+{
+  using DeviceT = Device<ArduinoTimer, ArduinoSemaphore, ArduinoTime, ArduinoIO, ArduinoQueue, 2>;
+public:
+  Listener(const Pins &pins, const char* name) : DeviceT(pins), name(name) {}
+  virtual ~Listener() = default;
+
+  virtual void start() override {}
+
+  virtual void process(const Frame &f) override {
+    io.log("%s: %08x", name, (uint32_t)f);
+  }
+
+protected:
+  const char *name;
+};
+
+static Listener slave_listener({.rx=slave_in, .tx=slave_out}, "S");
+static Listener master_listener({.rx=master_in, .tx=master_out}, "M");
+
+void slave2master_isr() {
+  digitalWrite(master_out, digitalRead(slave_in));
+  slave_listener.io.isr();
+}
+
+void master2slave_isr() {
+  digitalWrite(slave_out, digitalRead(master_in));
+  master_listener.io.isr();
+}
+
+void slave_rx_task(void *) {
+  slave_listener.rx_forever(nullptr, [](bool v){ digitalWrite(LED_BUILTIN, v ? HIGH : LOW); } );
+}
+
+void master_rx_task(void *) {
+  master_listener.rx_forever(nullptr, [](bool v){} );
+}
+
+static StaticTask_t slave_rx_task_buf;
+static StackType_t slave_rx_task_stack[128];
+
+static StaticTask_t master_rx_task_buf;
+static StackType_t master_rx_task_stack[128];
+
+void setup()
+{
+  pinMode(LED_BUILTIN, OUTPUT);
+  log_mtx = xSemaphoreCreateMutexStatic(&log_mtx_state);
+  xSemaphoreGive(log_mtx);
+
+  pinMode(master_in, INPUT_PULLUP);
+  pinMode(master_out, OUTPUT);
+  attachInterrupt(digitalPinToInterrupt(master_in), master2slave_isr, CHANGE);
+
+  pinMode(slave_in, INPUT_PULLUP);
+  pinMode(slave_out, OUTPUT);
+  attachInterrupt(digitalPinToInterrupt(slave_in), slave2master_isr, CHANGE);
+
+  Serial.begin(115200);
+  while (!Serial);
+
+  fdev_setup_stream(&uartf, uart_putchar, NULL, _FDEV_SETUP_WRITE);
+  stdout = &uartf;
+
+  log("Passthrough starting... ");
+
+  xTaskCreateStatic(slave_rx_task, "slave_rx_task", 128, NULL, 1, slave_rx_task_stack, &slave_rx_task_buf);
+  xTaskCreateStatic(master_rx_task, "master_rx_task", 128, NULL, 1, master_rx_task_stack, &master_rx_task_buf);
+
+  vTaskStartScheduler();
+}
+
+void loop() {}
+
+extern "C" {
+  void vAssertCalled(const char* file, int line) {
+    log("%s:%d: ASSERTION FAILED", file, line);
+    fflush(stdout);
+    // taskDISABLE_INTERRUPTS();
+    for( ;; );
+  }
+}

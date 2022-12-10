@@ -1,7 +1,0 @@
-{
-  "cpu": {
-    "fqbn": "arduino:avr:leonardo",
-    "name": "Arduino Leonardo",
-    "port": "serial://COM19"
-  }
-}
