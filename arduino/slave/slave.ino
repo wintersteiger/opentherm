@@ -9,14 +9,15 @@
 #include <timers.h>
 #include <semphr.h>
 
-#include "opentherm/transport.h"
+#include <opentherm/transport.h>
+#include <opentherm/application.h>
 
-#include "arduino_data_structures.h"
-#include "arduino_opentherm_io.h"
+#include "arduino_opentherm_ds.h"
 
 using namespace OpenTherm;
 
-static const unsigned slave_in = 3, slave_out = 5;
+ArduinoIO* io = NULL;
+Application::IDMeta Application::idmeta[256] = {0};
 
 static FILE uartf = {0};
 static SemaphoreHandle_t log_mtx = NULL;
@@ -46,12 +47,44 @@ void log(const char *fmt, ...) {
   va_end(args);
 }
 
+class SlaveApp : public Application {
+public:
+  SlaveApp(const Pins &pins) : Application(device), device(pins) {
+    device.set_frame_callback(Application::sprocess, this);
 
-static OpenTherm::Slave<ArduinoTimer, ArduinoSemaphore, ArduinoTime, ArduinoIO, ArduinoQueue, 2> slave({.rx=slave_in, .tx=slave_out});
+    sconfig_smemberid = (uint16_t)0x0300;
+    ot_version_master = 0.0f;
+    ot_version_slave = 2.2f;
+  }
 
-void rx_task(void *) {
-  slave.rx_forever(nullptr, [](bool v){ digitalWrite(LED_BUILTIN, v ? HIGH : LOW); } );
-}
+  virtual ~SlaveApp() = default;
+
+  virtual void on_read(uint8_t data_id, uint16_t data_value = 0x0000) override {
+    ::log("Read-Data(%d, %04x)", data_id, data_value);
+    Application::on_read(data_id, data_value);
+  }
+
+  virtual void on_write(uint8_t data_id, uint16_t data_value) override {
+    ::log("Write-Data(%d, %04x)", data_id, data_value);
+    Application::on_write(data_id, data_value);
+  }
+
+  virtual void on_invalid_data(uint8_t data_id, uint16_t data_value) {
+    ::log("Invalid-Data(%d, %04x)", data_id, data_value);
+    Application::on_invalid_data(data_id, data_value);
+  }
+
+  virtual void run() override {
+    device.rx_forever(nullptr, [](bool v){ digitalWrite(LED_BUILTIN, v ? HIGH : LOW); } );
+  }
+
+protected:
+  Slave<ArduinoTimer, ArduinoSemaphore, ArduinoTime, ArduinoQueue, ArduinoIO, 2> device;
+};
+
+static SlaveApp app({.rx=3, .tx=5, .owned=true});
+
+static void rx_task(void *) { app.run(); }
 
 static StaticTask_t rx_task_buf;
 static StackType_t rx_task_stack[128];
@@ -69,6 +102,7 @@ void setup()
   stdout = &uartf;
 
   log("Slave starting... ");
+  log("sizeof(app)=%d", sizeof(SlaveApp));
 
   xTaskCreateStatic(rx_task, "rx_task", 128, NULL, 1, rx_task_stack, &rx_task_buf);
 

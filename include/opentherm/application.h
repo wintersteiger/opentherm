@@ -5,16 +5,24 @@
 
 // OpenTherm 2.2 application layer
 
+extern void log(const char*, ...);
+extern void vlog(const char *fmt, va_list args);
+
 namespace OpenTherm {
 
 class Application {
 public:
-  Application(DeviceBase &device) : device(device) {}
+  Application(DeviceBase &device) :
+    device(device)
+  {
+    // device.set_frame_callback(sprocess, this);
+  }
+
   virtual ~Application() = default;
 
-  enum RWSpec { RO, WO, RW };
+  enum RWSpec : uint8_t { RO, WO, RW };
 
-  enum Type {
+  enum Type : uint8_t {
     flag8_flag8,
     F88,
     flag8_u8,
@@ -26,27 +34,33 @@ public:
     flag8_
   };
 
+  struct IDMeta {
+    RWSpec msg;
+    const char *data_object;
+    Type type;
+    const char *description;
+  };
+
   struct ID {
-    ID(uint8_t nr, RWSpec msg, std::string data_object, Type type,
-       std::string description, ID *index[256])
-        : nr(nr), msg(msg), data_object(data_object), type(type),
-          description(description) {
+    ID() = default;
+
+    ID(uint8_t nr, RWSpec msg, const char *data_object, Type type,
+       const char *description, ID *index[256], IDMeta *meta) :
+       value(0)
+    {
       index[nr] = this;
+      meta[nr] = IDMeta{msg, data_object, type, description };
     }
 
     virtual ~ID() = default;
 
-    uint8_t nr;
-    RWSpec msg;
-    std::string data_object;
-    Type type;
-    std::string description;
-
     uint16_t value = 0;
 
-    void set(uint16_t v) { value = v; }
+    ID& operator=(uint16_t v) { value = v; return *this; }
+    ID& operator=(float v) { value = v * 256.0f; return *this; }
+    ID& operator=(double v) { value = v * 256.0; return *this; }
 
-    const char * to_string() {
+    static const char * to_string(Type type) {
       switch (type) {
         case flag8_flag8: break;
         case F88: break;
@@ -64,10 +78,11 @@ public:
   };
 
   DeviceBase &device;
-  ID *index[256] = {0};
+  ID *index[256];
+  static IDMeta idmeta[256];
 
 #define DID(NR, MSG, FNAME, OBJECT, TYPE, DESC)                                \
-  ID FNAME = ID(NR, MSG, OBJECT, TYPE, DESC, index);
+  ID FNAME = ID(NR, MSG, OBJECT, TYPE, DESC, index, &idmeta[0]);
 
   // Ids 0 .. 127 are reserved for OpenTherm pre-defined information, while
   // id’s from 128 .. 255 can be used by manufacturers (members of the
@@ -124,13 +139,65 @@ public:
   DID(121, RW, ch_pump_ophours, "CH pump operation hours", u16, "Number of hours that CH pump has been running");
   DID(122, RW, dhw_pump_valve_ophours, "DHW pump/valve operation hours", u16, "Number of hours that DHW pump has been running or DHW valvehas been opened");
   DID(123, RW, dhw_burner_ophours, "DHW burner operation hours", u16, "Number of hours that burner is in operation during DHW mode");
-  DID(124, WO, ot_version_master, "OpenTherm version Master", F88, "The implemented version of the OpenTherm Protocol Specificationin the master.");
-  DID(125, RO, ot_version_slave, "OpenTherm version Slave", F88, "The implemented version of the OpenTherm Protocol Specificationin the slave.");
+  DID(124, WO, ot_version_master, "OpenTherm version Master", F88, "The implemented version of the OpenTherm Protocol Specification in the master.");
+  DID(125, RO, ot_version_slave, "OpenTherm version Slave", F88, "The implemented version of the OpenTherm Protocol Specification in the slave.");
   DID(126, WO, master_version, "Master-version", u8_u8, "Master product version number and type");
   DID(127, RO, slave_version, "Slave-version", u8_u8, "Slave product version number and type");
   // clang-format on
 
-  void process(const Frame& f) {}
+  virtual void run() = 0;
+
+  // Master to Slave
+  virtual void on_read(uint8_t data_id, uint16_t data_value = 0x0000) {
+    const ID *id = index[data_id];
+    if (id != NULL) {
+      // return DATA-INVALID(DATA-ID, DATA-VALUE) if the data ID is recognised but the data requested is not available or invalid. DATA-VALUE can be 0x0000 in this case.
+      device.tx(Frame(ReadACK, data_id, id->value));
+    }
+    else
+      device.tx(Frame(UnknownDataID, data_id, data_value));
+  }
+
+  virtual void on_write(uint8_t data_id, uint16_t data_value) {
+    ID *id = index[data_id];
+    if (id != NULL) {
+      id->value = data_value;
+      device.tx(Frame(WriteACK, data_id, data_value));
+    }
+    else
+      device.tx(Frame(UnknownDataID, data_id, data_value));
+  }
+
+  virtual void on_invalid_data(uint8_t data_id, uint16_t data_value) {
+    const ID *id = index[data_id];
+    if (id != NULL)
+      device.tx(Frame(DataInvalid, data_id, data_value));
+    else
+      device.tx(Frame(UnknownDataID, data_id, data_value));
+  }
+
+  // Slave to Master
+  virtual void on_read_ack(uint8_t data_id, uint16_t data_value) {}
+  virtual void on_write_ack(uint8_t data_id, uint16_t data_value) {}
+  virtual void on_data_invalid(uint8_t data_id, uint16_t data_value) {}
+  virtual void on_unknown_data_id(uint8_t data_id, uint16_t data_value) {}
+
+protected:
+  virtual void process(const Frame& f) {
+    switch (f.msg_type()) {
+      case ReadData: on_read(f.id(), f.value()); break;
+      case WriteData: on_write(f.id(), f.value()); break;
+      case InvalidData: on_invalid_data(f.id(), f.value()); break;
+      case ReadACK: on_read_ack(f.id(), f.value()); break;
+      case WriteACK: on_write_ack(f.id(), f.value()); break;
+      case DataInvalid: on_data_invalid(f.id(), f.value()); break;
+      case UnknownDataID: on_unknown_data_id(f.id(), f.value()); break;
+    }
+  }
+
+  static void sprocess(Application *app, const Frame& f) {
+    app->process(f);
+  }
 };
 
 } // namespace OpenTherm

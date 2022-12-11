@@ -1,0 +1,149 @@
+.program opentherm_tx
+.side_set 1 opt
+
+; We assume the clock is running at 10 khz. OpenTherm specifies 1kbit/s (2kbaud Manchester).
+; One bit transmitted every 10 cycles. 0 = rising, 1 = falling. 1 start bit, 1 stop bit, both 1.
+
+public start:
+  out x, 1                    ; Autopull; 'out' stalls/blocks on empty buffers.
+  set y, 31
+
+  nop             side 1 [4]
+  jmp !x do_0     side 0 [4]
+  nop             side 1
+
+do_1:
+  nop             side 1 [3]  ; High for 5 cycles (1 from jmp do_1)
+  jmp y-- bitloop side 0 [2]  ; Low for 5 (2 in bitloop)
+  jmp stop        side 0 [1]
+do_0:
+  nop             side 0 [4]  ; Low for 5
+  jmp y-- bitloop side 1 [2]  ; High for 5
+  jmp stop        side 1 [1]
+bitloop:
+  out x, 1
+  jmp !x do_0
+  jmp do_1        side 1
+
+stop:
+  nop side 1 [4]
+  nop side 0 [4]
+
+% c-sdk {
+static inline void opentherm_tx_init(PIO pio, uint sm, uint offset, uint pin) {
+    pio_sm_set_pins_with_mask(pio, sm, 0, 1u << pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+    pio_gpio_init(pio, pin);
+
+    pio_sm_config c = opentherm_tx_program_get_default_config(offset);
+    sm_config_set_sideset_pins(&c, pin);
+    sm_config_set_out_shift(&c, false, true, 32);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    float hz = (float)clock_get_hz(clk_sys);
+    float clk_div = ((float)hz) / 10000.0;
+    sm_config_set_clkdiv(&c, clk_div);
+
+    pio_sm_init(pio, sm, offset + opentherm_tx_offset_start, &c);
+
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
+; Version with all levels inverted
+.program opentherm_tx_inv
+.side_set 1 opt
+
+public start:
+  out x, 1                    ; Autopull; 'out' stalls/blocks on empty buffers.
+  set y, 31
+
+  nop             side 0 [4]
+  jmp !x do_0     side 1 [4]
+  nop             side 0
+
+do_1:
+  nop             side 0 [3]  ; High for 5 cycles (1 from jmp do_1)
+  jmp y-- bitloop side 1 [2]  ; Low for 5 (2 in bitloop)
+  jmp stop        side 1 [1]
+do_0:
+  nop             side 1 [4]  ; Low for 5
+  jmp y-- bitloop side 0 [2]  ; High for 5
+  jmp stop        side 0 [1]
+bitloop:
+  out x, 1
+  jmp !x do_0
+  jmp do_1        side 0
+
+stop:
+  nop side 0 [4]
+  nop side 1 [4]
+
+% c-sdk {
+static inline void opentherm_tx_inv_init(PIO pio, uint sm, uint offset, uint pin) {
+    pio_sm_set_pins_with_mask(pio, sm, 1u << pin, 1u << pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+    pio_gpio_init(pio, pin);
+
+    pio_sm_config c = opentherm_tx_inv_program_get_default_config(offset);
+    sm_config_set_sideset_pins(&c, pin);
+    sm_config_set_out_shift(&c, false, true, 32);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    float hz = (float)clock_get_hz(clk_sys);
+    float clk_div = ((float)hz) / 10000.0;
+    sm_config_set_clkdiv(&c, clk_div);
+
+    pio_sm_init(pio, sm, offset + opentherm_tx_offset_start, &c);
+
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
+.program opentherm_rx
+
+.wrap_target
+start:
+  wait 1 pin 0 [4]
+  wait 0 pin 0 [4]
+  set x, 31 [1]
+
+bitloop:
+  in pins, 1 [4]
+  ;; in pins, 1
+  ; check for transition? extract both bits and check for errors later?
+  jmp x-- bitloop [4]
+
+  jmp pin ok
+  jmp error ; invalid stop bit
+
+ok:
+  push noblock
+  jmp start
+
+error:
+  irq set 0 rel
+.wrap
+
+% c-sdk {
+static inline void opentherm_rx_init(PIO pio, uint sm, uint offset, uint pin) {
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+    pio_gpio_init(pio, pin);
+    gpio_pull_down(pin);
+
+    pio_sm_config c = opentherm_rx_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin);
+    sm_config_set_jmp_pin(&c, pin);
+    sm_config_set_in_shift(&c, false, false, 32);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    float hz = (float)clock_get_hz(clk_sys);
+    float clk_div = ((float)hz) / 10000.0;
+    sm_config_set_clkdiv(&c, clk_div);
+
+    pio_sm_init(pio, sm, offset, &c);
+
+    pio_sm_exec(pio, sm, pio_encode_wait_pin(1, 0) | pio_encode_delay(2));
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

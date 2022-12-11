@@ -11,10 +11,11 @@
 
 #include "opentherm/transport.h"
 
-#include "arduino_data_structures.h"
-#include "arduino_opentherm_io.h"
+#include "arduino_opentherm_ds.h"
 
 using namespace OpenTherm;
+
+ArduinoIO* io = NULL;
 
 static const unsigned master_in = 2, master_out = 4;
 static const unsigned slave_in = 3, slave_out = 5;
@@ -47,9 +48,9 @@ void log(const char *fmt, ...) {
   va_end(args);
 }
 
-class Listener : public Device<ArduinoTimer, ArduinoSemaphore, ArduinoTime, ArduinoIO, ArduinoQueue, 2>
+class Listener : public Device<ArduinoTimer, ArduinoSemaphore, ArduinoTime, ArduinoQueue, ArduinoIO, 2>
 {
-  using DeviceT = Device<ArduinoTimer, ArduinoSemaphore, ArduinoTime, ArduinoIO, ArduinoQueue, 2>;
+  using DeviceT = Device<ArduinoTimer, ArduinoSemaphore, ArduinoTime, ArduinoQueue, ArduinoIO, 2>;
 public:
   Listener(const Pins &pins, const char* name) : DeviceT(pins), name(name) {}
   virtual ~Listener() = default;
@@ -60,12 +61,14 @@ public:
     io.log("%s: %08x", name, (uint32_t)f);
   }
 
+  virtual RequestID tx(const Frame & f, bool skip_if_busy = false, void (*callback)(RequestStatus, const Frame &) = nullptr) override {}
+
 protected:
   const char *name;
 };
 
-static Listener slave_listener({.rx=slave_in, .tx=slave_out}, "S");
-static Listener master_listener({.rx=master_in, .tx=master_out}, "M");
+static Listener slave_listener({.rx=slave_in, .tx=slave_out, .owned=false}, "S");
+static Listener master_listener({.rx=master_in, .tx=master_out, .owned=false}, "M");
 
 void slave2master_isr() {
   digitalWrite(master_out, digitalRead(slave_in));

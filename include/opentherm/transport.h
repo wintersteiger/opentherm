@@ -16,6 +16,9 @@
 #define PRIu64 "%llu"
 #endif
 
+extern void log(const char*, ...);
+extern void vlog(const char *fmt, va_list args);
+
 namespace OpenTherm {
 
 class Frame;
@@ -80,14 +83,23 @@ public:
   virtual void sleep_us(uint64_t) const = 0;
 };
 
+struct Pins {
+  unsigned rx;
+  unsigned tx;
+  bool owned;
+};
+
 class IO {
 public:
-  IO() = default;
+  IO(const Pins &pins) : pins(pins) {}
   virtual ~IO() = default;
   virtual void send(const Frame &) = 0;
   virtual void send(Frame &&f) { send(f); }
   virtual Frame get_blocking() = 0;
   virtual void log(const char *fmt, ...) = 0;
+
+protected:
+  const Pins pins;
 };
 
 enum MsgType : uint8_t {
@@ -111,16 +123,17 @@ struct Frame {
   Frame(uint32_t data) : data(data) {}
 
   Frame(MsgType msg_type, uint8_t id, uint16_t value) {
-    data = (static_cast<uint8_t>(msg_type) << 28) | (id << 16) | value;
+    data = (static_cast<uint32_t>(msg_type) << 28) | (static_cast<uint32_t>(id) << 16) | value;
   }
 
+  bool parity() const { return data >> 31 != 0; }
   MsgType msg_type() const { return static_cast<MsgType>((data >> 28) & 0x07); }
   uint8_t id() const { return (data >> 16) & 0xFF; }
   uint16_t value() const { return data & 0xFFFF; }
   uint8_t data_byte_1() const { return (data >> 8) & 0xFF; }
   uint8_t data_byte_2() const { return data & 0xFF; }
 
-  bool parity() const {
+  bool compute_parity() const {
     bool r = false;
     uint32_t t = data & 0x7FFFFFFF;
     while (t != 0) {
@@ -132,10 +145,10 @@ struct Frame {
   }
 
   bool parity_ok() const {
-    return parity() == (data >> 31);
+    return compute_parity() == parity();
   }
 
-  operator uint32_t() const { return (data & 0x70FFFFFF) | parity() << 31; }
+  operator uint32_t() const { return (data & 0x70FFFFFF) | (compute_parity() ? 0x80000000 : 0); }
 };
 
 using RequestID = uint64_t;
@@ -161,27 +174,33 @@ struct Response {
   RequestStatus status = RequestStatus::ERROR;
 };
 
-struct Pins {
-  unsigned rx;
-  unsigned tx;
-};
+class Application;
 
 class DeviceBase {
 public:
   DeviceBase() = default;
   virtual ~DeviceBase() = default;
+
+  virtual void set_frame_callback(void (*cb)(Application *app, const Frame &), Application *obj) {
+    frame_callback = cb;
+    frame_callback_obj = obj;
+  }
+
+  virtual RequestID tx(const Frame & f, bool skip_if_busy = false, void (*callback)(RequestStatus, const Frame &) = nullptr) = 0;
+
+protected:
+  void (*frame_callback)(Application *app, const Frame &) = nullptr;
+  Application *frame_callback_obj = nullptr;
 };
 
 template <typename TimerType, typename SemaphoreType, typename TimeType,
-          typename IOType, template <typename> typename QueueType,
+          template <typename> typename QueueType, typename IOType,
           size_t max_concurrent_requests = 16>
 class Device : public DeviceBase {
 public:
   Device(const Pins &pins) :
-    io(pins.rx, pins.tx),
-    rx_frame_count(0),
-    next_request_id(0),
-    requests(max_concurrent_requests)
+    io(pins),
+    rx_frame_count(0)
   {}
 
   virtual ~Device(){};
@@ -192,11 +211,6 @@ public:
   IOType io;
   Frame rx_last;
   uint64_t rx_frame_count = 0;
-  RequestID next_request_id = 0;
-  QueueType<Request> requests;
-  Response responses[max_concurrent_requests];
-
-  unsigned num_outstanding_requests() const { return requests.level(); }
 
   virtual void start() = 0;
   virtual void process(const Frame &f) = 0;
@@ -222,64 +236,14 @@ public:
         blink(false);
     }
   }
-
-  bool is_finished(uint64_t rid) {
-    Response &r = responses[rid % max_concurrent_requests];
-    return r.status != RequestStatus::PENDING;
-  }
-
-  RequestStatus get(uint64_t rid, Frame &f) {
-    Response &r = responses[rid % max_concurrent_requests];
-    if (r.id != rid)
-      io.log("warning: outdated response id %" PRIu64, rid);
-    if (r.status != RequestStatus::PENDING)
-      f = r.f;
-    return r.status;
-  }
-
-  RequestID tx(Frame f, bool skip_if_busy = false,
-               void (*callback)(RequestStatus, const Frame &) = nullptr)
-      __attribute__((noinline)) {
-    if (next_request_id == NoRequestID)
-      next_request_id++;
-    Request req(next_request_id++, skip_if_busy, f, callback);
-    Response &rsp = responses[req.id % max_concurrent_requests];
-    rsp.id = req.id;
-    rsp.status = RequestStatus::PENDING;
-    if (!requests.try_add(req)) {
-      rsp.status = RequestStatus::ERROR;
-      return NoRequestID;
-    } else
-      return req.id;
-  }
-
-  void tx_forever() {
-    Frame reply;
-    while (true) {
-      auto req = requests.remove();
-
-      Response &r = responses[req.id % max_concurrent_requests];
-      r.id = req.id;
-      if (!converse(req, r.f))
-        r.status = req.skip_if_busy ? RequestStatus::SKIPPED
-                                    : RequestStatus::TIMED_OUT;
-      else
-        r.status = RequestStatus::OK;
-
-      if (req.callback) {
-        io.log("tx_forever: callback for rid=%lu", req.id);
-        req.callback(r.status, r.f);
-      }
-    }
-  }
 };
 
 template <typename TimerType, typename SemaphoreType, typename TimeType,
-          typename IOType, template <typename> typename QueueType,
+          template <typename> typename QueueType, typename IOType,
           size_t max_concurrent_requests = 16>
-class Master : public Device<TimerType, SemaphoreType, TimeType, IOType, QueueType, max_concurrent_requests>
+class Master : public Device<TimerType, SemaphoreType, TimeType, QueueType, IOType, max_concurrent_requests>
 {
-  using DeviceT = Device<TimerType, SemaphoreType, TimeType, IOType, QueueType, max_concurrent_requests>;
+  using DeviceT = Device<TimerType, SemaphoreType, TimeType, QueueType, IOType, max_concurrent_requests>;
   using DeviceT::io;
   using DeviceT::tx_sem;
   using DeviceT::rx_sem;
@@ -289,10 +253,15 @@ class Master : public Device<TimerType, SemaphoreType, TimeType, IOType, QueueTy
 public:
   using DeviceT::rx_once;
   using DeviceT::rx_forever;
-  using DeviceT::tx_forever;
   using DeviceT::tx;
+  using DeviceT::frame_callback;
+  using DeviceT::frame_callback_obj;
 
-  Master(const Pins &pins) : DeviceT(pins) {
+  Master(const Pins &pins) :
+    DeviceT(pins),
+    next_request_id(0),
+    requests(max_concurrent_requests)
+  {
       master_timer = TimerType(
           0, 1000000,
           [](Timer *, void *data) {
@@ -341,8 +310,8 @@ public:
   virtual ~Master() = default;
 
   virtual void start() override {
-      master_timer.start();
-      plus_check_timer.start();
+    master_timer.start();
+    plus_check_timer.start();
   }
 
   bool converse(const Request &req, Frame &reply) __attribute__((noinline)) {
@@ -394,7 +363,6 @@ public:
   virtual void process(const Frame &f) override
   {
     if (f.parity_ok()) {
-      io.log("Slave: process %08x", (uint32_t)f);
       switch (f.msg_type()) {
         case ReadACK:
           if (f.id() == 0) {
@@ -411,45 +379,112 @@ public:
         default:
           io.log("unexpected message type: %d", f.msg_type());
       }
+      if (frame_callback)
+        frame_callback(frame_callback_obj, f);
+    }
+    else
+      io.log("Master: parity not ok: %08x", f.data);
+  }
+
+  virtual RequestID tx(const Frame &f, bool skip_if_busy = false,
+               void (*callback)(RequestStatus, const Frame &) = nullptr) override
+      __attribute__((noinline)) {
+    if (next_request_id == NoRequestID)
+      next_request_id++;
+    Request req(next_request_id++, skip_if_busy, f, callback);
+    Response &rsp = responses[req.id % max_concurrent_requests];
+    rsp.id = req.id;
+    rsp.status = RequestStatus::PENDING;
+    if (!requests.try_add(req)) {
+      rsp.status = RequestStatus::ERROR;
+      return NoRequestID;
+    } else
+      return req.id;
+  }
+
+  bool is_finished(uint64_t rid) {
+    Response &r = responses[rid % max_concurrent_requests];
+    return r.status != RequestStatus::PENDING;
+  }
+
+  unsigned num_outstanding_requests() const { return requests.level(); }
+
+  RequestStatus get(uint64_t rid, Frame &f) {
+    Response &r = responses[rid % max_concurrent_requests];
+    if (r.id != rid)
+      io.log("warning: outdated response id %" PRIu64, rid);
+    if (r.status != RequestStatus::PENDING)
+      f = r.f;
+    return r.status;
+  }
+
+  void tx_forever() {
+    Frame reply;
+    while (true) {
+      auto req = requests.remove();
+
+      Response &r = responses[req.id % max_concurrent_requests];
+      r.id = req.id;
+      if (!converse(req, r.f))
+        r.status = req.skip_if_busy ? RequestStatus::SKIPPED
+                                    : RequestStatus::TIMED_OUT;
+      else
+        r.status = RequestStatus::OK;
+
+      if (req.callback) {
+        io.log("tx_forever: callback for rid=%lu", req.id);
+        req.callback(r.status, r.f);
+      }
     }
   }
 
 protected:
   uint8_t slave_status = 0x00;
   TimerType master_timer, plus_check_timer, tx_sem_release_timer;
+
+  RequestID next_request_id = 0;
+  QueueType<Request> requests;
+  Response responses[max_concurrent_requests];
 };
 
 template <typename TimerType, typename SemaphoreType, typename TimeType,
-          typename IOType, template <typename> typename QueueType,
+          template <typename> typename QueueType, typename IOType,
           size_t max_concurrent_requests = 16>
 class Slave
-    : public Device<TimerType, SemaphoreType, TimeType, IOType, QueueType, max_concurrent_requests>
+    : public Device<TimerType, SemaphoreType, TimeType, QueueType, IOType, max_concurrent_requests>
 {
-  using DeviceT = Device<TimerType, SemaphoreType, TimeType, IOType, QueueType, max_concurrent_requests>;
+  using DeviceT = Device<TimerType, SemaphoreType, TimeType, QueueType, IOType, max_concurrent_requests>;
 public:
   using DeviceT::rx_once;
   using DeviceT::rx_forever;
-  using DeviceT::tx_forever;
   using DeviceT::tx;
   using DeviceT::io;
+  using DeviceT::frame_callback;
+  using DeviceT::frame_callback_obj;
 
-  Slave(const Pins &pins)
-      : Device<TimerType, SemaphoreType, TimeType, IOType, QueueType, max_concurrent_requests>(pins) {}
+  Slave(const Pins &pins) : DeviceT(pins) {}
   virtual ~Slave() = default;
 
   virtual void start() override {}
 
   virtual void process(const Frame &f) override {
-    if (f.parity_ok()) {
-      io.log("Slave: process %08x", (uint32_t)f);
+    if (frame_callback && f.parity_ok()) {
       switch (f.msg_type()) {
-        case ReadData: break;
-        case WriteData: break;
-        case InvalidData: break;
+        case ReadData:
+        case WriteData:
+        case InvalidData:
+          frame_callback(frame_callback_obj, f);
+          break;
         default:
           io.log("unexpected message type: %d", f.msg_type());
       }
     }
+  }
+
+  virtual RequestID tx(const Frame &f, bool skip_if_busy = false, void (*callback)(RequestStatus, const Frame &) = nullptr) override
+  {
+    io.send(f);
+    return NoRequestID;
   }
 
 protected:
