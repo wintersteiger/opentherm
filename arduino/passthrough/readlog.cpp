@@ -80,11 +80,11 @@ int main(int argc, const char **argv)
     else {
       double delta_t = (time-prev_time) / 1e6;
       const char *dev = c == 'S' ? "T" : "B";
+      Frame f(msg);
 
-      if (c == 'S')
+      if (c == 'S' && f.id() != 0)
         continue;
 
-      Frame f(msg);
       printf("%6.3f %s %s", delta_t, dev, f.to_string());
       Application::ID *id = app.index[f.id()];
       Application::IDMeta &meta = MyApp::idmeta[f.id()];
@@ -104,11 +104,19 @@ int main(int argc, const char **argv)
         }
       }
       if (f.id() == 0) {
-        printf("  fault: %d ch: %d dhw: %d flame: %d",
-          (f.value() & 0x01) != 0,
-          (f.value() & 0x02) != 0,
-          (f.value() & 0x04) != 0,
-          (f.value() & 0x08) != 0);
+        if (c == 'S')
+          printf("  ch: %d dhw: %d cool: %d otc: %d ch2: %d",
+            (f.value() & 0x01) != 0,
+            (f.value() & 0x02) != 0,
+            (f.value() & 0x04) != 0,
+            (f.value() & 0x08) != 0,
+            (f.value() & 0x10) != 0);
+        else
+          printf("  fault: %d ch: %d dhw: %d flame: %d",
+            (f.value() & 0x01) != 0,
+            (f.value() & 0x02) != 0,
+            (f.value() & 0x04) != 0,
+            (f.value() & 0x08) != 0);
       }
       printf("\n");
     }
