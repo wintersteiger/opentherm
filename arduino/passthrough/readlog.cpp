@@ -106,11 +106,11 @@ int main(int argc, const char **argv)
       if (f.id() == 0) {
         if (c == 'S')
           printf("  ch: %d dhw: %d cool: %d otc: %d ch2: %d",
-            (f.value() & 0x01) != 0,
-            (f.value() & 0x02) != 0,
-            (f.value() & 0x04) != 0,
-            (f.value() & 0x08) != 0,
-            (f.value() & 0x10) != 0);
+            (f.value() & 0x0100) != 0,
+            (f.value() & 0x0200) != 0,
+            (f.value() & 0x0400) != 0,
+            (f.value() & 0x0800) != 0,
+            (f.value() & 0x1000) != 0);
         else
           printf("  fault: %d ch: %d dhw: %d flame: %d",
             (f.value() & 0x01) != 0,
