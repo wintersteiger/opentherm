@@ -49,46 +49,57 @@ public:
     device.process(f);
   }
 
+  bool outp = false;
+
   virtual void on_read(uint8_t id, uint16_t value = 0x0000) override {
     Application::on_read(id, value);
 
-    if (id == 0)
-      printf("ch: %d dhw: %d cool: %d otc: %d ch2: %d",
-        (value & 0x0100) != 0,
-        (value & 0x0200) != 0,
-        (value & 0x0400) != 0,
-        (value & 0x0800) != 0,
-        (value & 0x1000) != 0);
+    if (outp && id == 0) {
+      Application::IDMeta &meta = MyApp::idmeta[id];
+        printf("%s == %s", meta.data_object, ID::to_string(meta.type, value));
+        printf("\t\tch: %d dhw: %d cool: %d otc: %d ch2: %d",
+          (value & 0x0100) != 0,
+          (value & 0x0200) != 0,
+          (value & 0x0400) != 0,
+          (value & 0x0800) != 0,
+          (value & 0x1000) != 0);
+    }
   }
 
   virtual void on_read_ack(uint8_t id, uint16_t value = 0x0000) override {
     Application::on_read_ack(id, value);
-    Application::ID *idp = index[id];
-    if (!idp)
-      printf("unknown data ID");
-    else
+    if (outp)
     {
-      Application::IDMeta &meta = MyApp::idmeta[id];
-      printf("%s == %s", meta.data_object, ID::to_string(meta.type, value));
+      Application::ID *idp = index[id];
+      if (!idp)
+        printf("unknown data ID");
+      else
+      {
+        Application::IDMeta &meta = MyApp::idmeta[id];
+        printf("%s == %s", meta.data_object, ID::to_string(meta.type, value));
 
-      if (id == 0) {
-        printf("fault: %d ch: %d dhw: %d flame: %d",
-          (value & 0x01) != 0,
-          (value & 0x02) != 0,
-          (value & 0x04) != 0,
-          (value & 0x08) != 0);
+        if (id == 0) {
+          printf("\t\tfault: %d ch: %d dhw: %d flame: %d",
+            (value & 0x01) != 0,
+            (value & 0x02) != 0,
+            (value & 0x04) != 0,
+            (value & 0x08) != 0);
+        }
       }
     }
   }
   virtual void on_write_ack(uint8_t id, uint16_t value = 0x0000) override {
     Application::on_write_ack(id, value);
-    Application::ID *idp = index[id];
-    if (!idp)
-      printf("unknown data ID");
-    else
+    if (outp)
     {
-      Application::IDMeta &meta = MyApp::idmeta[id];
-      printf("%s := %s", meta.data_object, ID::to_string(meta.type, value));
+      Application::ID *idp = index[id];
+      if (!idp)
+        printf("unknown data ID");
+      else
+      {
+        Application::IDMeta &meta = MyApp::idmeta[id];
+        printf("%s := %s", meta.data_object, ID::to_string(meta.type, value));
+      }
     }
   }
 
@@ -137,9 +148,14 @@ int main(int argc, const char **argv)
       if (c == 'S' && f.id() != 0)
         continue;
 
-      printf("%6.3f %s %s \t", delta_t, dev, f.to_string());
+      std::unordered_set<uint16_t> filter = {10, 11, 12, 13, 113, 114};
+      bool outp = filter.find(f.id()) == filter.end();
+      if (outp)
+        printf("%6.3f %s %s \t", delta_t, dev, f.to_string());
+      app.outp = outp;
       app.dev_process(f);
-      printf("\n");
+      if (outp)
+        printf("\n");
     }
 
     prev_time = time;
