@@ -30,6 +30,16 @@ public:
 
   virtual void run() override {}
 
+  void update(uint8_t id, uint16_t value) {
+    ID* idp = index[id];
+    if (!idp) {
+      idp = new ID();
+      index[id] = idp;
+      idmeta[id] = IDMeta{RWSpec::RW, "unknown", Type::u16, ""};
+    }
+    idp->value = value;
+  }
+
 protected:
   MyDevice device;
 };
@@ -67,6 +77,7 @@ int main(int argc, const char **argv)
     else {
       double delta_t = (time-prev_time) / 1e6;
       const char *dev = c == 'S' ? "T" : "B";
+
       if (c == 'S')
         continue;
 
@@ -81,11 +92,20 @@ int main(int argc, const char **argv)
         switch (f.msg_type()) {
           case ReadACK:
             printf(" %s == %s", meta.data_object, id->to_string(meta.type, f.value()));
+            app.update(f.id(), f.value());
             break;
           case WriteACK:
             printf(" %s := %s", meta.data_object, id->to_string(meta.type, f.value()));
+            app.update(f.id(), f.value());
             break;
         }
+      }
+      if (f.id() == 0) {
+        printf("  fault: %d ch: %d dhw: %d flame: %d",
+          (f.value() & 0x01) != 0,
+          (f.value() & 0x02) != 0,
+          (f.value() & 0x04) != 0,
+          (f.value() & 0x08) != 0);
       }
       printf("\n");
     }

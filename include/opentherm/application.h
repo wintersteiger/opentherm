@@ -56,50 +56,40 @@ public:
       return *this;
     }
 
-    ID &operator=(float v) {
-      value = v * 256.0f;
-      return *this;
-    }
-
-    ID &operator=(double v) {
-      value = v * 256.0;
-      return *this;
-    }
-
-    operator float() { return value / 256.0f; }
-    operator double() { return value / 256.0; }
-
     const char *to_string(Type type, uint16_t value) {
-      static char buf[256];
+      static char buf[128];
       switch (type) {
       case flag8_flag8:
-        sprintf(buf, "%02x/%02x", value >> 16, value);
+        snprintf(buf, sizeof(buf), "%02x/%02x", value >> 8, value & 0x00FF);
         break;
-      case F88:
-        sprintf(buf, "%f", (double)(value) / 256.0);
+      case F88: {
+        float f = ((signed)value) / 256.0f;
+        snprintf(buf, sizeof(buf), "%.2f", f);
         break;
+      }
       case flag8_u8:
-        sprintf(buf, "%02x/%u", value >> 16, value);
+        snprintf(buf, sizeof(buf), "%02x/%u", value >> 8, value & 0x00FF);
         break;
       case u8_u8:
-        sprintf(buf, "%u/%u", value >> 16, value);
+        snprintf(buf, sizeof(buf), "%u/%u", value >> 8, value & 0x00FF);
         break;
       case s8_s8:
-        sprintf(buf, "%d/%d", (int8_t)(value >> 16), (int8_t)value);
+        snprintf(buf, sizeof(buf), "%d/%d", (int8_t)(value >> 8), (int8_t)value);
         break;
       case u16:
-        sprintf(buf, "%u", value);
+        snprintf(buf, sizeof(buf), "%u", value);
         break;
       case s16:
-        sprintf(buf, "%d", (int16_t)value);
+        snprintf(buf, sizeof(buf), "%d", (int16_t)value);
         break;
       case special_u8:
-        sprintf(buf, "XXX/%u", value & 0x00FF);
+        snprintf(buf, sizeof(buf), "XXX/%u", value & 0x00FF);
         break;
       case flag8_:
-        sprintf(buf, "%02x", value >> 16);
+        snprintf(buf, sizeof(buf), "%02x", value >> 8);
         break;
       default:
+        snprintf(buf, sizeof(buf), "unknown type");
         break;
       }
       return buf;
@@ -172,6 +162,8 @@ public:
   DID(125, RO, ot_version_slave, "OpenTherm version Slave", F88, "The implemented version of the OpenTherm Protocol Specification in the slave.");
   DID(126, WO, master_version, "Master-version", u8_u8, "Master product version number and type");
   DID(127, RO, slave_version, "Slave-version", u8_u8, "Slave product version number and type");
+
+  DID( 35, RW, boiler_fan_speed, "Boiler fan speed", u8_u8, "Boiler fan speed setpoint and actual value");
   // clang-format on
 
   virtual void run() = 0;
