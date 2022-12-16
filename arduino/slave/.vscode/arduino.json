@@ -1,0 +1,5 @@
+{
+    "port": "COM19",
+    "board": "arduino:avr:leonardo",
+    "sketch": "slave.ino"
+}

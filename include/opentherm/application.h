@@ -5,16 +5,11 @@
 
 // OpenTherm 2.2 application layer
 
-extern void log(const char*, ...);
-extern void vlog(const char *fmt, va_list args);
-
 namespace OpenTherm {
 
 class Application {
 public:
-  Application(DeviceBase &device) :
-    device(device)
-  {
+  Application(DeviceBase &device) : device(device) {
     // device.set_frame_callback(sprocess, this);
   }
 
@@ -45,33 +40,56 @@ public:
     ID() = default;
 
     ID(uint8_t nr, RWSpec msg, const char *data_object, Type type,
-       const char *description, ID *index[256], IDMeta *meta) :
-       value(0)
-    {
+       const char *description, ID *index[256], IDMeta *meta)
+        : value(0) {
       index[nr] = this;
-      meta[nr] = IDMeta{msg, data_object, type, description };
+      meta[nr] = IDMeta{msg, data_object, type, description};
     }
 
     virtual ~ID() = default;
 
     uint16_t value = 0;
 
-    ID& operator=(uint16_t v) { value = v; return *this; }
-    ID& operator=(float v) { value = v * 256.0f; return *this; }
-    ID& operator=(double v) { value = v * 256.0; return *this; }
+    ID &operator=(uint16_t v) {
+      value = v;
+      return *this;
+    }
 
-    static const char * to_string(Type type) {
+    ID &operator=(float v) {
+      value = v * 256.0f;
+      return *this;
+    }
+
+    ID &operator=(double v) {
+      value = v * 256.0;
+      return *this;
+    }
+
+    operator float() { return value / 256.0f; }
+    operator double() { return value / 256.0; }
+
+    const char *to_string(Type type, uint16_t value) {
       switch (type) {
-        case flag8_flag8: break;
-        case F88: break;
-        case flag8_u8: break;
-        case u8_u8: break;
-        case s8_s8: break;
-        case u16: break;
-        case s16: break;
-        case special_u8: break;
-        case flag8_: break;
-        default: break;
+      case flag8_flag8:
+        break;
+      case F88:
+        break;
+      case flag8_u8:
+        break;
+      case u8_u8:
+        break;
+      case s8_s8:
+        break;
+      case u16:
+        break;
+      case s16:
+        break;
+      case special_u8:
+        break;
+      case flag8_:
+        break;
+      default:
+        break;
       }
       return "";
     }
@@ -151,10 +169,11 @@ public:
   virtual void on_read(uint8_t data_id, uint16_t data_value = 0x0000) {
     const ID *id = index[data_id];
     if (id != NULL) {
-      // return DATA-INVALID(DATA-ID, DATA-VALUE) if the data ID is recognised but the data requested is not available or invalid. DATA-VALUE can be 0x0000 in this case.
+      // return DATA-INVALID(DATA-ID, DATA-VALUE) if the data ID is recognised
+      // but the data requested is not available or invalid. DATA-VALUE can be
+      // 0x0000 in this case.
       device.tx(Frame(ReadACK, data_id, id->value));
-    }
-    else
+    } else
       device.tx(Frame(UnknownDataID, data_id, data_value));
   }
 
@@ -163,8 +182,7 @@ public:
     if (id != NULL) {
       id->value = data_value;
       device.tx(Frame(WriteACK, data_id, data_value));
-    }
-    else
+    } else
       device.tx(Frame(UnknownDataID, data_id, data_value));
   }
 
@@ -183,21 +201,33 @@ public:
   virtual void on_unknown_data_id(uint8_t data_id, uint16_t data_value) {}
 
 protected:
-  virtual void process(const Frame& f) {
+  virtual void process(const Frame &f) {
     switch (f.msg_type()) {
-      case ReadData: on_read(f.id(), f.value()); break;
-      case WriteData: on_write(f.id(), f.value()); break;
-      case InvalidData: on_invalid_data(f.id(), f.value()); break;
-      case ReadACK: on_read_ack(f.id(), f.value()); break;
-      case WriteACK: on_write_ack(f.id(), f.value()); break;
-      case DataInvalid: on_data_invalid(f.id(), f.value()); break;
-      case UnknownDataID: on_unknown_data_id(f.id(), f.value()); break;
+    case ReadData:
+      on_read(f.id(), f.value());
+      break;
+    case WriteData:
+      on_write(f.id(), f.value());
+      break;
+    case InvalidData:
+      on_invalid_data(f.id(), f.value());
+      break;
+    case ReadACK:
+      on_read_ack(f.id(), f.value());
+      break;
+    case WriteACK:
+      on_write_ack(f.id(), f.value());
+      break;
+    case DataInvalid:
+      on_data_invalid(f.id(), f.value());
+      break;
+    case UnknownDataID:
+      on_unknown_data_id(f.id(), f.value());
+      break;
     }
   }
 
-  static void sprocess(Application *app, const Frame& f) {
-    app->process(f);
-  }
+  static void sprocess(Application &app, const Frame &f) { app.process(f); }
 };
 
 } // namespace OpenTherm

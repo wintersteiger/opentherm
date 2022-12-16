@@ -1,0 +1,6 @@
+{
+  "arduino.commandPath": "arduino-cli.exe",
+  "arduino.path": "C:\\Program Files\\Arduino CLI",
+  "arduino.useArduinoCli": true,
+  "C_Cpp.intelliSenseEngine": "Tag Parser"
+}

@@ -1,0 +1,52 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Pico Debug",
+      "cwd": "${workspaceRoot}",
+      "executable": "${workspaceFolder}/build/openthermostat.elf",
+      "request": "launch",
+      "type": "cortex-debug",
+      "servertype": "openocd",
+      "gdbPath": "gdb-multiarch",
+      "device": "RP2040",
+      "configFiles": [
+        "interface/picoprobe.cfg",
+        "target/rp2040.cfg"
+      ],
+      "serverArgs": [
+        "-s",
+        "/home/cwinter/openocd/tcl"
+      ],
+      "svdFile": "${env:PICO_SDK_PATH}/src/rp2040/hardware_regs/rp2040.svd",
+      "runToEntryPoint": "main",
+      "postRestartCommands": [
+        "break main",
+        "continue"
+      ]
+    },
+    {
+      "name": "otcli",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/cli/build/otcli",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}/cli/build",
+      "environment": [],
+      "externalConsole": false,
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing for gdb",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Set Disassembly Flavor to Intel",
+          "text": "-gdb-set disassembly-flavor intel",
+          "ignoreFailures": true
+        }
+      ]
+    }
+  ]
+}

@@ -9,6 +9,9 @@
 
 #include "opentherm.pio.h"
 
+extern void vllog(const char *fmt, va_list args);
+extern void llog(const char *fmt, ...);
+
 class PicoTimer : public OpenTherm::Timer {
 public:
   PicoTimer() = default;
@@ -35,7 +38,7 @@ public:
     if (delay_us == 0) {
       if (!alarm_pool_add_repeating_timer_us(alarm_pool, -period_us, pcb, this,
                                              &t))
-        log("No alarm slots available!");
+        llog("No alarm slots available!");
     } else {
       alarm_id =
           alarm_pool_add_alarm_in_us(alarm_pool, delay_us, acb, this, true);
@@ -88,7 +91,7 @@ public:
   virtual bool try_acquire() override { return sem_try_acquire(&sem); }
   virtual void release() override {
     if (!sem_release(&sem))
-      log("sem_release failed");
+      llog("sem_release failed");
   }
   virtual bool acquire_timeout(uint64_t us) override {
     return sem_acquire_timeout_us(&sem, us);
@@ -165,7 +168,7 @@ public:
   virtual void log(const char *fmt, ...) override {
     va_list args;
     va_start(args, fmt);
-    ::vlog(fmt, args);
+    ::vllog(fmt, args);
     va_end(args);
   }
 

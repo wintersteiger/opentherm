@@ -58,10 +58,13 @@ public:
   virtual void start() override {}
 
   virtual void process(const Frame &f) override {
-    io.log("%s: %08x", name, (uint32_t)f);
+    uint32_t msg = (uint32_t)f;
+    io.log("%s: %04x%04x", name, msg >> 16, msg & 0x00FF);
   }
 
-  virtual RequestID tx(const Frame & f, bool skip_if_busy = false, void (*callback)(RequestStatus, const Frame &) = nullptr) override {}
+  virtual RequestID tx(const Frame & f, bool skip_if_busy = false,
+    void (*callback)(Application*, RequestStatus, const Frame &) = nullptr,
+    Application *app = nullptr) override {}
 
 protected:
   const char *name;
@@ -71,21 +74,21 @@ static Listener slave_listener({.rx=slave_in, .tx=slave_out, .owned=false}, "S")
 static Listener master_listener({.rx=master_in, .tx=master_out, .owned=false}, "M");
 
 void slave2master_isr() {
-  digitalWrite(master_out, digitalRead(slave_in));
+  digitalWrite(master_out, !digitalRead(slave_in));
   slave_listener.io.isr();
 }
 
 void master2slave_isr() {
-  digitalWrite(slave_out, digitalRead(master_in));
+  digitalWrite(slave_out, !digitalRead(master_in));
   master_listener.io.isr();
 }
 
 void slave_rx_task(void *) {
-  slave_listener.rx_forever(nullptr, [](bool v){ digitalWrite(LED_BUILTIN, v ? HIGH : LOW); } );
+  slave_listener.rx_forever([](bool v){ digitalWrite(LED_BUILTIN, v ? HIGH : LOW); });
 }
 
 void master_rx_task(void *) {
-  master_listener.rx_forever(nullptr, [](bool v){} );
+  master_listener.rx_forever([](bool v){} );
 }
 
 static StaticTask_t slave_rx_task_buf;
@@ -96,6 +99,8 @@ static StackType_t master_rx_task_stack[128];
 
 void setup()
 {
+  Serial.begin(115200);
+
   pinMode(LED_BUILTIN, OUTPUT);
   log_mtx = xSemaphoreCreateMutexStatic(&log_mtx_state);
   xSemaphoreGive(log_mtx);
@@ -108,13 +113,10 @@ void setup()
   pinMode(slave_out, OUTPUT);
   attachInterrupt(digitalPinToInterrupt(slave_in), slave2master_isr, CHANGE);
 
-  Serial.begin(115200);
-  while (!Serial);
-
   fdev_setup_stream(&uartf, uart_putchar, NULL, _FDEV_SETUP_WRITE);
   stdout = &uartf;
 
-  log("Passthrough starting... ");
+  log("Passthrough starting...");
 
   xTaskCreateStatic(slave_rx_task, "slave_rx_task", 128, NULL, 1, slave_rx_task_stack, &slave_rx_task_buf);
   xTaskCreateStatic(master_rx_task, "master_rx_task", 128, NULL, 1, master_rx_task_stack, &master_rx_task_buf);

@@ -69,13 +69,13 @@ public:
     Application::on_write(data_id, data_value);
   }
 
-  virtual void on_invalid_data(uint8_t data_id, uint16_t data_value) {
+  virtual void on_invalid_data(uint8_t data_id, uint16_t data_value) override {
     ::log("Invalid-Data(%d, %04x)", data_id, data_value);
     Application::on_invalid_data(data_id, data_value);
   }
 
   virtual void run() override {
-    device.rx_forever(nullptr, [](bool v){ digitalWrite(LED_BUILTIN, v ? HIGH : LOW); } );
+    device.rx_forever([](bool v){ digitalWrite(LED_BUILTIN, v ? HIGH : LOW); } );
   }
 
 protected:
@@ -91,12 +91,11 @@ static StackType_t rx_task_stack[128];
 
 void setup()
 {
+  Serial.begin(115200);
+
   pinMode(LED_BUILTIN, OUTPUT);
   log_mtx = xSemaphoreCreateMutexStatic(&log_mtx_state);
   xSemaphoreGive(log_mtx);
-
-  Serial.begin(115200);
-  while (!Serial);
 
   fdev_setup_stream(&uartf, uart_putchar, NULL, _FDEV_SETUP_WRITE);
   stdout = &uartf;

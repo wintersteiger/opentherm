@@ -36,8 +36,10 @@ public:
   CLIDevice() = default;
   virtual ~CLIDevice() = default;
 
-  virtual RequestID tx(const Frame & f, bool skip_if_busy = false, void (*callback)(RequestStatus, const Frame &) = nullptr) override
-  {
+  virtual RequestID tx(const Frame &f, bool skip_if_busy = false,
+                       void (*callback)(Application*, RequestStatus,
+                                        const Frame &) = nullptr,
+                       Application *app = nullptr) override {
     return NoRequestID;
   }
 };
@@ -213,7 +215,7 @@ void send_msg(const Frame &f) {
     const std::lock_guard<std::mutex> lock(log_mtx);
     std::cout << "X error: " << (unsigned)err << std::endl;
   }
-  static const char prog_chars[] = { '-', '\\', '|', '/' };
+  static const char prog_chars[] = {'-', '\\', '|', '/'};
   int pci = 0;
   do {
     auto after = std::chrono::system_clock::now();
@@ -313,8 +315,7 @@ void register_cmds() {
   };
 }
 
-void ask_for_input()
-{
+void ask_for_input() {
   const std::lock_guard<std::mutex> lock(log_mtx);
   std::cout << "\r* ";
   std::cout.flush();

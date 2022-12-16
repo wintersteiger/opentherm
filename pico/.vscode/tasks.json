@@ -1,0 +1,47 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Flash Pico",
+      "type": "shell",
+      "command": "/home/cwinter/openocd/src/openocd",
+      "args": [
+        "-s",
+        "/home/cwinter/pico",
+        "-f",
+        "interface/picoprobe.cfg",
+        "-f",
+        "target/rp2040.cfg",
+        "-s",
+        "/home/cwinter/openocd/tcl",
+        "-c",
+        "program openthermostat.elf reset exit"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/build"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Reset Pico",
+      "type": "shell",
+      "command": "/home/cwinter/openocd/src/openocd",
+      "args": [
+        "-s",
+        "/home/cwinter/pico",
+        "-f",
+        "interface/picoprobe.cfg",
+        "-f",
+        "target/rp2040.cfg",
+        "-s",
+        "/home/cwinter/openocd/tcl",
+        "-c",
+        "init; reset run; exit"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/build"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

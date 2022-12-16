@@ -12,7 +12,7 @@
 #endif
 
 #define MEM_ALIGNMENT               4
-#define MEM_SIZE                    4000
+#define MEM_SIZE                    6000
 #define MEMP_NUM_TCP_SEG            32
 #define MEMP_NUM_ARP_QUEUE          10
 #define PBUF_POOL_SIZE              24
@@ -28,9 +28,9 @@
 #define LWIP_NETIF_LINK_CALLBACK    1
 #define LWIP_NETIF_HOSTNAME         1
 #define LWIP_NETCONN                0
-#define MEM_STATS                   0
+#define MEM_STATS                   1
 #define SYS_STATS                   0
-#define MEMP_STATS                  0
+#define MEMP_STATS                  1
 #define LINK_STATS                  0
 #define LWIP_CHKSUM_ALGORITHM       3
 #define LWIP_DHCP                   1
@@ -88,7 +88,5 @@
 #define LWIP_HTTPD_FS_ASYNC_READ      1
 #define LWIP_HTTPD_FILE_EXTENSION     1
 #define HTTPD_POLL_INTERVAL           2
-
-#define LWIP_TCPIP_CORE_LOCKING       1
 
 #endif

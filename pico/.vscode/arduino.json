@@ -1,0 +1,6 @@
+{
+    "port": "/dev/ttyACM0",
+    "board": "arduino:avr:leonardo",
+    "sketch": "samples/uno-passthrough/uno-passthrough.ino",
+    "programmer": "avrisp"
+}

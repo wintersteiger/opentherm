@@ -16,12 +16,10 @@
 #define PRIu64 "%llu"
 #endif
 
-extern void log(const char*, ...);
-extern void vlog(const char *fmt, va_list args);
-
 namespace OpenTherm {
 
 class Frame;
+class Application;
 
 class BinarySemaphore {
 public:
@@ -62,9 +60,10 @@ public:
 
   virtual void start(uint64_t delay_us = 0) = 0;
   virtual void stop(bool run_fstop = true) = 0;
-  virtual void tick() {
-    if (ftick)
-      ftick(this, data);
+  virtual bool tick() {
+    if (!ftick)
+      return false;
+    return ftick(this, data);
   }
 
 protected:
@@ -123,7 +122,14 @@ struct Frame {
   Frame(uint32_t data) : data(data) {}
 
   Frame(MsgType msg_type, uint8_t id, uint16_t value) {
-    data = (static_cast<uint32_t>(msg_type) << 28) | (static_cast<uint32_t>(id) << 16) | value;
+    data = (static_cast<uint32_t>(msg_type) << 28) |
+           (static_cast<uint32_t>(id) << 16) | value;
+  }
+
+  Frame(MsgType msg_type, uint8_t id, uint8_t db1, uint8_t db2) {
+    data = (static_cast<uint32_t>(msg_type) << 28) |
+           (static_cast<uint32_t>(id) << 16) |
+           (static_cast<uint32_t>(db1) << 8) | db2;
   }
 
   bool parity() const { return data >> 31 != 0; }
@@ -144,11 +150,27 @@ struct Frame {
     return r;
   }
 
-  bool parity_ok() const {
-    return compute_parity() == parity();
+  bool parity_ok() const { return compute_parity() == parity(); }
+
+  operator uint32_t() const {
+    return (data & 0x70FFFFFF) | (compute_parity() ? 0x80000000 : 0);
   }
 
-  operator uint32_t() const { return (data & 0x70FFFFFF) | (compute_parity() ? 0x80000000 : 0); }
+  const char* to_string() {
+    static char strbuf[32];
+    const char *fn = "Unknown-Msg-Type";
+    switch (msg_type()) {
+      case ReadData: fn = "Read-Data"; break;
+      case WriteData: fn = "Write-Data"; break;
+      case InvalidData: fn = "Invalid-Data"; break;
+      case ReadACK: fn = "Read-Ack"; break;
+      case WriteACK: fn = "Write-Ack"; break;
+      case DataInvalid: fn = "Data-Invalid"; break;
+      case UnknownDataID: fn = "Unknown-DataID"; break;
+    }
+    snprintf(strbuf, sizeof(strbuf), "%s(%d, %04x)", fn, id(), value());
+    return strbuf;
+  }
 };
 
 using RequestID = uint64_t;
@@ -158,14 +180,18 @@ enum class RequestStatus { OK = 0, TIMED_OUT, SKIPPED, ERROR, PENDING };
 
 struct Request {
   Request(RequestID id = NoRequestID, bool skip_if_busy = false, Frame f = {0},
-          void (*callback)(RequestStatus, const Frame &) = nullptr)
-      : id(id), skip_if_busy(skip_if_busy), f(f), callback(callback) {}
+          void (*callback)(Application *, RequestStatus,
+                           const Frame &) = nullptr,
+          Application *app = nullptr)
+      : id(id), skip_if_busy(skip_if_busy), f(f), callback(callback),
+        application(app) {}
   virtual ~Request() = default;
 
   RequestID id = NoRequestID;
   bool skip_if_busy = false;
   Frame f = {0};
-  void (*callback)(RequestStatus, const Frame &) = nullptr;
+  void (*callback)(Application *, RequestStatus, const Frame &) = nullptr;
+  Application *application = nullptr;
 };
 
 struct Response {
@@ -174,22 +200,24 @@ struct Response {
   RequestStatus status = RequestStatus::ERROR;
 };
 
-class Application;
-
 class DeviceBase {
 public:
   DeviceBase() = default;
   virtual ~DeviceBase() = default;
 
-  virtual void set_frame_callback(void (*cb)(Application *app, const Frame &), Application *obj) {
+  virtual void set_frame_callback(void (*cb)(Application &, const Frame &),
+                                  Application *obj) {
     frame_callback = cb;
     frame_callback_obj = obj;
   }
 
-  virtual RequestID tx(const Frame & f, bool skip_if_busy = false, void (*callback)(RequestStatus, const Frame &) = nullptr) = 0;
+  virtual RequestID tx(const Frame &f, bool skip_if_busy = false,
+                       void (*callback)(Application *, RequestStatus,
+                                        const Frame &) = nullptr,
+                       Application *app = nullptr) = 0;
 
 protected:
-  void (*frame_callback)(Application *app, const Frame &) = nullptr;
+  void (*frame_callback)(Application &, const Frame &) = nullptr;
   Application *frame_callback_obj = nullptr;
 };
 
@@ -198,10 +226,7 @@ template <typename TimerType, typename SemaphoreType, typename TimeType,
           size_t max_concurrent_requests = 16>
 class Device : public DeviceBase {
 public:
-  Device(const Pins &pins) :
-    io(pins),
-    rx_frame_count(0)
-  {}
+  Device(const Pins &pins) : io(pins), rx_frame_count(0) {}
 
   virtual ~Device(){};
 
@@ -215,7 +240,7 @@ public:
   virtual void start() = 0;
   virtual void process(const Frame &f) = 0;
 
-  Frame rx_once() __attribute__((noinline)) {
+  Frame rx_once() {
     rx_sem.acquire_blocking();
     rx_last = io.get_blocking();
     rx_frame_count++;
@@ -223,15 +248,12 @@ public:
     return rx_last;
   }
 
-  void rx_forever(void (*callback)(const Frame &) = nullptr,
-                  void (*blink)(bool) = nullptr) __attribute__((noinline)) {
+  void rx_forever(void (*blink)(bool) = nullptr) {
     while (true) {
       Frame f = rx_once();
       if (blink)
         blink(true);
       process(f);
-      if (callback)
-        callback(f);
       if (blink)
         blink(false);
     }
@@ -241,71 +263,69 @@ public:
 template <typename TimerType, typename SemaphoreType, typename TimeType,
           template <typename> typename QueueType, typename IOType,
           size_t max_concurrent_requests = 16>
-class Master : public Device<TimerType, SemaphoreType, TimeType, QueueType, IOType, max_concurrent_requests>
-{
-  using DeviceT = Device<TimerType, SemaphoreType, TimeType, QueueType, IOType, max_concurrent_requests>;
+class Master : public Device<TimerType, SemaphoreType, TimeType, QueueType,
+                             IOType, max_concurrent_requests> {
+protected:
+  using DeviceT = Device<TimerType, SemaphoreType, TimeType, QueueType, IOType,
+                         max_concurrent_requests>;
   using DeviceT::io;
-  using DeviceT::tx_sem;
-  using DeviceT::rx_sem;
   using DeviceT::rx_last;
+  using DeviceT::rx_sem;
+  using DeviceT::status;
   using DeviceT::time;
+  using DeviceT::tx_sem;
 
 public:
-  using DeviceT::rx_once;
-  using DeviceT::rx_forever;
-  using DeviceT::tx;
   using DeviceT::frame_callback;
   using DeviceT::frame_callback_obj;
+  using DeviceT::rx_forever;
+  using DeviceT::rx_once;
+  using DeviceT::tx;
 
-  Master(const Pins &pins) :
-    DeviceT(pins),
-    next_request_id(0),
-    requests(max_concurrent_requests)
-  {
-      master_timer = TimerType(
-          0, 1000000,
-          [](Timer *, void *data) {
-            DeviceT *d = (DeviceT*)data;
-            d->tx(Frame(OpenTherm::MsgType::ReadData, 0x00, d->status << 8),
-                  true);
-            return true;
-          },
-          nullptr, this);
+  Master(const Pins &pins)
+      : DeviceT(pins), next_request_id(0), requests(max_concurrent_requests) {
+    master_timer = TimerType(
+        0, 1000000,
+        [](Timer *, void *data) {
+          ((Master *)data)->next_master_msg();
+          return true;
+        },
+        nullptr, this);
 
-      plus_check_timer = TimerType(
-          0, 20000000,
-          [](Timer *timer, void *data) {
-            timer->stop();
-            return true;
-          },
-          [](Timer *timer, void *data) {
-            DeviceT *d = (DeviceT*)data;
-            if (d->rx_frame_count == 0) {
-              d->io.log(
-                  "No OpenTherm/plus reply after startup; the slave does not "
-                  "seem to support OpenTherm/plus.");
+    plus_check_timer = TimerType(
+        0, 20000000,
+        [](Timer *timer, void *data) {
+          timer->stop();
+          return false;
+        },
+        [](Timer *timer, void *data) {
+          DeviceT *d = static_cast<DeviceT *>(data);
+          if (d->rx_frame_count == 0) {
+            d->io.log(
+                "No OpenTherm/plus reply after startup; the slave does not "
+                "seem to support OpenTherm/plus.");
 #ifdef NDEBUG
-              d->io.log("OpenTherm/- not supported; giving up.");
-              d->master_timer.stop();
+            d->io.log("OpenTherm/- not supported; giving up.");
+            d->master_timer.stop();
 #else
-              d->io.log("Not giving up, though.");
+            d->io.log("Not giving up, though.");
 #endif
-            } else
-              d->io.log("OpenTherm/plus ok (%" PRIu64 ").", d->rx_frame_count);
-            return true;
-          },
-          this);
+          } else
+            d->io.log("OpenTherm/plus ok (%" PRIu64 ").", d->rx_frame_count);
+          return true;
+        },
+        this);
 
-      tx_sem_release_timer = TimerType(
-          0, 0,
-          [](Timer *timer, void *data) {
-            DeviceT *d = (DeviceT *)data;
-            timer->stop(false);
-            d->tx_sem.release();
-            return true;
-          },
-          nullptr, this);
-    }
+    tx_sem_release_timer = TimerType(
+        0, 0,
+        [](Timer *timer, void *data) {
+          DeviceT *d = static_cast<DeviceT *>(data);
+          timer->stop(false);
+          d->tx_sem.release();
+          return true;
+        },
+        nullptr, this);
+  }
 
   virtual ~Master() = default;
 
@@ -314,7 +334,11 @@ public:
     plus_check_timer.start();
   }
 
-  bool converse(const Request &req, Frame &reply) __attribute__((noinline)) {
+  virtual void next_master_msg() {
+    tx(Frame(OpenTherm::MsgType::ReadData, 0x00, status, 0x00), true);
+  }
+
+  bool converse(const Request &req, Frame &reply) {
     volatile uint64_t frame_time = 0;
     volatile bool acquired = false;
 
@@ -360,38 +384,30 @@ public:
     return acquired;
   }
 
-  virtual void process(const Frame &f) override
-  {
+  virtual void process(const Frame &f) override {
     if (f.parity_ok()) {
       switch (f.msg_type()) {
-        case ReadACK:
-          if (f.id() == 0) {
-            auto nos = f.data_byte_2();
-            if (nos != slave_status) {
-              io.log("New slave status: %02x", nos);
-              slave_status = nos;
-            }
-          }
-          break;
-        case WriteACK: break;
-        case DataInvalid: break;
-        case UnknownDataID: break;
-        default:
-          io.log("unexpected message type: %d", f.msg_type());
+      case ReadACK:
+      case WriteACK:
+      case DataInvalid:
+      case UnknownDataID:
+        break;
+      default:
+        io.log("unexpected message type: %d", f.msg_type());
       }
-      if (frame_callback)
-        frame_callback(frame_callback_obj, f);
-    }
-    else
+      if (frame_callback && frame_callback_obj)
+        frame_callback(*frame_callback_obj, f);
+    } else
       io.log("Master: parity not ok: %08x", f.data);
   }
 
   virtual RequestID tx(const Frame &f, bool skip_if_busy = false,
-               void (*callback)(RequestStatus, const Frame &) = nullptr) override
-      __attribute__((noinline)) {
+                       void (*callback)(Application *, RequestStatus,
+                                        const Frame &) = nullptr,
+                       Application *app = nullptr) override {
     if (next_request_id == NoRequestID)
       next_request_id++;
-    Request req(next_request_id++, skip_if_busy, f, callback);
+    Request req(next_request_id++, skip_if_busy, f, callback, app);
     Response &rsp = responses[req.id % max_concurrent_requests];
     rsp.id = req.id;
     rsp.status = RequestStatus::PENDING;
@@ -431,10 +447,8 @@ public:
       else
         r.status = RequestStatus::OK;
 
-      if (req.callback) {
-        io.log("tx_forever: callback for rid=%lu", req.id);
-        req.callback(r.status, r.f);
-      }
+      if (req.callback && req.application)
+        req.callback(req.application, r.status, r.f);
     }
   }
 
@@ -450,17 +464,18 @@ protected:
 template <typename TimerType, typename SemaphoreType, typename TimeType,
           template <typename> typename QueueType, typename IOType,
           size_t max_concurrent_requests = 16>
-class Slave
-    : public Device<TimerType, SemaphoreType, TimeType, QueueType, IOType, max_concurrent_requests>
-{
-  using DeviceT = Device<TimerType, SemaphoreType, TimeType, QueueType, IOType, max_concurrent_requests>;
+class Slave : public Device<TimerType, SemaphoreType, TimeType, QueueType,
+                            IOType, max_concurrent_requests> {
+  using DeviceT = Device<TimerType, SemaphoreType, TimeType, QueueType, IOType,
+                         max_concurrent_requests>;
+
 public:
-  using DeviceT::rx_once;
-  using DeviceT::rx_forever;
-  using DeviceT::tx;
-  using DeviceT::io;
   using DeviceT::frame_callback;
   using DeviceT::frame_callback_obj;
+  using DeviceT::io;
+  using DeviceT::rx_forever;
+  using DeviceT::rx_once;
+  using DeviceT::tx;
 
   Slave(const Pins &pins) : DeviceT(pins) {}
   virtual ~Slave() = default;
@@ -470,19 +485,21 @@ public:
   virtual void process(const Frame &f) override {
     if (frame_callback && f.parity_ok()) {
       switch (f.msg_type()) {
-        case ReadData:
-        case WriteData:
-        case InvalidData:
-          frame_callback(frame_callback_obj, f);
-          break;
-        default:
-          io.log("unexpected message type: %d", f.msg_type());
+      case ReadData:
+      case WriteData:
+      case InvalidData:
+        frame_callback(*frame_callback_obj, f);
+        break;
+      default:
+        io.log("unexpected message type: %d", f.msg_type());
       }
     }
   }
 
-  virtual RequestID tx(const Frame &f, bool skip_if_busy = false, void (*callback)(RequestStatus, const Frame &) = nullptr) override
-  {
+  virtual RequestID tx(const Frame &f, bool skip_if_busy = false,
+                       void (*callback)(Application *, RequestStatus,
+                                        const Frame &) = nullptr,
+                       Application *app = nullptr) override {
     io.send(f);
     return NoRequestID;
   }
