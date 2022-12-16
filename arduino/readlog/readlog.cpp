@@ -76,7 +76,8 @@ public:
       else
       {
         Application::IDMeta &meta = MyApp::idmeta[id];
-        printf("%s == %s", meta.data_object, ID::to_string(meta.type, value));
+        if (id != 3 || idp->value != value)
+          printf("%s == %s", meta.data_object, ID::to_string(meta.type, value));
 
         if (id == 0) {
           printf("\t\tfault: %d ch: %d dhw: %d flame: %d",
@@ -85,9 +86,12 @@ public:
             (value & 0x04) != 0,
             (value & 0x08) != 0);
         }
+        
+        idp->value = value;
       }
     }
   }
+
   virtual void on_write_ack(uint8_t id, uint16_t value = 0x0000) override {
     Application::on_write_ack(id, value);
     if (outp)
@@ -99,6 +103,7 @@ public:
       {
         Application::IDMeta &meta = MyApp::idmeta[id];
         printf("%s := %s", meta.data_object, ID::to_string(meta.type, value));
+        idp->value = value;
       }
     }
   }
@@ -148,7 +153,7 @@ int main(int argc, const char **argv)
       if (c == 'S' && f.id() != 0)
         continue;
 
-      std::unordered_set<uint16_t> filter = {10, 11, 12, 13, 113, 114};
+      std::unordered_set<uint16_t> filter = {10, 11, 12, 13, 15, 27, 113, 114, 125, 127};
       bool outp = filter.find(f.id()) == filter.end();
       if (outp)
         printf("%6.3f %s %s \t", delta_t, dev, f.to_string());
