@@ -59,7 +59,9 @@ public:
 
   virtual void process(const Frame &f) override {
     uint32_t msg = (uint32_t)f;
-    io.log("%s: %04x%04x", name, msg >> 16, msg & 0x00FF);
+    char buf[32];
+    sprintf(buf, "%08lx", msg);
+    io.log("%s: %s", name, buf);
   }
 
   virtual RequestID tx(const Frame & f, bool skip_if_busy = false,
@@ -92,10 +94,10 @@ void master_rx_task(void *) {
 }
 
 static StaticTask_t slave_rx_task_buf;
-static StackType_t slave_rx_task_stack[128];
+static StackType_t slave_rx_task_stack[256];
 
 static StaticTask_t master_rx_task_buf;
-static StackType_t master_rx_task_stack[128];
+static StackType_t master_rx_task_stack[256];
 
 void setup()
 {
@@ -118,8 +120,8 @@ void setup()
 
   log("Passthrough starting...");
 
-  xTaskCreateStatic(slave_rx_task, "slave_rx_task", 128, NULL, 1, slave_rx_task_stack, &slave_rx_task_buf);
-  xTaskCreateStatic(master_rx_task, "master_rx_task", 128, NULL, 1, master_rx_task_stack, &master_rx_task_buf);
+  xTaskCreateStatic(slave_rx_task, "slave_rx_task", 256, NULL, 1, slave_rx_task_stack, &slave_rx_task_buf);
+  xTaskCreateStatic(master_rx_task, "master_rx_task", 256, NULL, 1, master_rx_task_stack, &master_rx_task_buf);
 
   vTaskStartScheduler();
 }
@@ -131,6 +133,6 @@ extern "C" {
     log("%s:%d: ASSERTION FAILED", file, line);
     fflush(stdout);
     // taskDISABLE_INTERRUPTS();
-    for( ;; );
+    // for( ;; );
   }
 }
