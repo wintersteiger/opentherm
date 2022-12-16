@@ -48,17 +48,20 @@ static MyApp app;
 
 int main(int argc, const char **argv)
 {
-  if (argc != 2) {
-    std::cout << "Usage: " << argv[0] << " <filename>" << std::endl;
+  if (argc != 1 && argc != 2) {
+    std::cout << "Usage: " << argv[0] << " [filename]" << std::endl;
     return 1;
   }
 
-  const char *filename = argv[1];
-  FILE *f = fopen(filename, "r");
+  FILE *f = stdin;
 
-  if (!f) {
-    std::cout << "failure to open " << filename << std::endl;
-    return 2;
+  if (argc == 2) {
+    const char *filename = argv[1];
+    f = fopen(filename, "r");
+    if (!f) {
+      std::cout << "failure to open " << filename << std::endl;
+      return 2;
+    }
   }
 
   uint64_t prev_time = 0, time = 0;
