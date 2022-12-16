@@ -163,7 +163,11 @@ public:
   DID(126, WO, master_version, "Master-version", u8_u8, "Master product version number and type");
   DID(127, RO, slave_version, "Slave-version", u8_u8, "Slave product version number and type");
 
+  DID( 34, RO, heat_ex_temp, "Theatex", F88, "Boiler heat exchanger temperature (°C)");
   DID( 35, RW, boiler_fan_speed, "Boiler fan speed", u8_u8, "Boiler fan speed setpoint and actual value");
+  DID( 36, RO, burner_flame_current, "Burner flame current", s16, "Electrical current through burner flame [µA]");
+  DID( 37, WO, tr2, "Tr2", F88, "Room temperature for 2nd CH circuit (°C)");
+  DID( 38, RW, humidity, "Humidity", s16, "Relative Humidity");
   // clang-format on
 
   virtual void run() = 0;
