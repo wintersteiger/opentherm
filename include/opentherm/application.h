@@ -56,7 +56,7 @@ public:
       return *this;
     }
 
-    const char *to_string(Type type, uint16_t value) {
+    static const char *to_string(Type type, uint16_t value) {
       static char buf[128];
       switch (type) {
       case flag8_flag8:

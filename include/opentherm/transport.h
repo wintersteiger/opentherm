@@ -216,6 +216,26 @@ public:
                                         const Frame &) = nullptr,
                        Application *app = nullptr) = 0;
 
+  virtual void process(const Frame &f) {
+    if (f.parity_ok()) {
+      switch (f.msg_type()) {
+      case ReadData:
+      case WriteData:
+      case InvalidData:
+      case ReadACK:
+      case WriteACK:
+      case DataInvalid:
+      case UnknownDataID:
+        break;
+      default:
+        printf("unexpected message type: %d", f.msg_type());
+      }
+      if (frame_callback && frame_callback_obj)
+        frame_callback(*frame_callback_obj, f);
+    } else
+      printf("parity not ok: %08x", f.data);
+  }
+
 protected:
   void (*frame_callback)(Application &, const Frame &) = nullptr;
   Application *frame_callback_obj = nullptr;
@@ -238,7 +258,6 @@ public:
   uint64_t rx_frame_count = 0;
 
   virtual void start() = 0;
-  virtual void process(const Frame &f) = 0;
 
   Frame rx_once() {
     rx_sem.acquire_blocking();

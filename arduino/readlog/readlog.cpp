@@ -1,5 +1,7 @@
 #include <stdio.h>
+
 #include <iostream>
+#include <unordered_set>
 
 #include <opentherm/transport.h>
 #include <opentherm/application.h>
@@ -25,7 +27,10 @@ public:
 
 class MyApp : public Application {
 public:
-  MyApp() : Application(device) {}
+  MyApp() : Application(device) {
+    device.set_frame_callback(Application::sprocess, this);
+  }
+
   virtual ~MyApp() = default;
 
   virtual void run() override {}
@@ -38,6 +43,53 @@ public:
       idmeta[id] = IDMeta{RWSpec::RW, "unknown", Type::u16, ""};
     }
     idp->value = value;
+  }
+
+  void dev_process(const Frame &f) {
+    device.process(f);
+  }
+
+  virtual void on_read(uint8_t id, uint16_t value = 0x0000) override {
+    Application::on_read(id, value);
+
+    if (id == 0)
+      printf("ch: %d dhw: %d cool: %d otc: %d ch2: %d",
+        (value & 0x0100) != 0,
+        (value & 0x0200) != 0,
+        (value & 0x0400) != 0,
+        (value & 0x0800) != 0,
+        (value & 0x1000) != 0);
+  }
+
+  virtual void on_read_ack(uint8_t id, uint16_t value = 0x0000) override {
+    Application::on_read_ack(id, value);
+    Application::ID *idp = index[id];
+    if (!idp)
+      printf("unknown data ID");
+    else
+    {
+      Application::IDMeta &meta = MyApp::idmeta[id];
+      printf("%s == %s", meta.data_object, ID::to_string(meta.type, value));
+
+      if (id == 0) {
+        printf("fault: %d ch: %d dhw: %d flame: %d",
+          (value & 0x01) != 0,
+          (value & 0x02) != 0,
+          (value & 0x04) != 0,
+          (value & 0x08) != 0);
+      }
+    }
+  }
+  virtual void on_write_ack(uint8_t id, uint16_t value = 0x0000) override {
+    Application::on_write_ack(id, value);
+    Application::ID *idp = index[id];
+    if (!idp)
+      printf("unknown data ID");
+    else
+    {
+      Application::IDMeta &meta = MyApp::idmeta[id];
+      printf("%s := %s", meta.data_object, ID::to_string(meta.type, value));
+    }
   }
 
 protected:
@@ -85,39 +137,8 @@ int main(int argc, const char **argv)
       if (c == 'S' && f.id() != 0)
         continue;
 
-      printf("%6.3f %s %s", delta_t, dev, f.to_string());
-      Application::ID *id = app.index[f.id()];
-      Application::IDMeta &meta = MyApp::idmeta[f.id()];
-      if (!id) {
-        printf(" unknown data ID");
-      }
-      else {
-        switch (f.msg_type()) {
-          case ReadACK:
-            printf(" %s == %s", meta.data_object, id->to_string(meta.type, f.value()));
-            app.update(f.id(), f.value());
-            break;
-          case WriteACK:
-            printf(" %s := %s", meta.data_object, id->to_string(meta.type, f.value()));
-            app.update(f.id(), f.value());
-            break;
-        }
-      }
-      if (f.id() == 0) {
-        if (c == 'S')
-          printf("  ch: %d dhw: %d cool: %d otc: %d ch2: %d",
-            (f.value() & 0x0100) != 0,
-            (f.value() & 0x0200) != 0,
-            (f.value() & 0x0400) != 0,
-            (f.value() & 0x0800) != 0,
-            (f.value() & 0x1000) != 0);
-        else
-          printf("  fault: %d ch: %d dhw: %d flame: %d",
-            (f.value() & 0x01) != 0,
-            (f.value() & 0x02) != 0,
-            (f.value() & 0x04) != 0,
-            (f.value() & 0x08) != 0);
-      }
+      printf("%6.3f %s %s \t", delta_t, dev, f.to_string());
+      app.dev_process(f);
       printf("\n");
     }
 
