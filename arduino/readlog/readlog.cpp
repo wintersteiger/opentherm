@@ -50,12 +50,14 @@ public:
   }
 
   bool outp = false;
+  uint16_t master_state = 0;
 
   virtual void on_read(uint8_t id, uint16_t value = 0x0000) override {
     Application::on_read(id, value);
 
     if (outp && id == 0) {
-      Application::IDMeta &meta = MyApp::idmeta[id];
+      if (value != master_state) {
+        Application::IDMeta &meta = MyApp::idmeta[id];
         printf("%s == %s", meta.data_object, ID::to_string(meta.type, value));
         printf("\t\tch: %d dhw: %d cool: %d otc: %d ch2: %d",
           (value & 0x0100) != 0,
@@ -63,6 +65,8 @@ public:
           (value & 0x0400) != 0,
           (value & 0x0800) != 0,
           (value & 0x1000) != 0);
+      }
+      master_state = value;
     }
   }
 
@@ -76,17 +80,18 @@ public:
       else
       {
         Application::IDMeta &meta = MyApp::idmeta[id];
-        if (id != 3 || idp->value != value)
-          printf("%s == %s", meta.data_object, ID::to_string(meta.type, value));
+        if ((id != 0 && id != 3) || idp->value != value) {
+            printf("%s == %s", meta.data_object, ID::to_string(meta.type, value));
 
-        if (id == 0) {
-          printf("\t\tfault: %d ch: %d dhw: %d flame: %d",
-            (value & 0x01) != 0,
-            (value & 0x02) != 0,
-            (value & 0x04) != 0,
-            (value & 0x08) != 0);
+          if (id == 0 && (idp->value & 0x00FF) != (value & 0x00FF)) {
+            printf("\t\tfault: %d ch: %d dhw: %d flame: %d",
+              (value & 0x01) != 0,
+              (value & 0x02) != 0,
+              (value & 0x04) != 0,
+              (value & 0x08) != 0);
+          }
         }
-        
+
         idp->value = value;
       }
     }
