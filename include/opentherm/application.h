@@ -41,7 +41,8 @@ public:
 
     ID(uint8_t nr, RWSpec msg, const char *data_object, Type type,
        const char *description, ID *index[256], IDMeta *meta)
-        : value(0) {
+        : value(0)
+    {
       index[nr] = this;
       meta[nr] = IDMeta{msg, data_object, type, description};
     }
@@ -69,29 +70,39 @@ public:
     operator double() { return value / 256.0; }
 
     const char *to_string(Type type, uint16_t value) {
+      static char buf[256];
       switch (type) {
       case flag8_flag8:
+        sprintf(buf, "%02x/%02x", value >> 16, value);
         break;
       case F88:
+        sprintf(buf, "%f", (double)(value) / 256.0);
         break;
       case flag8_u8:
+        sprintf(buf, "%02x/%u", value >> 16, value);
         break;
       case u8_u8:
+        sprintf(buf, "%u/%u", value >> 16, value);
         break;
       case s8_s8:
+        sprintf(buf, "%d/%d", (int8_t)(value >> 16), (int8_t)value);
         break;
       case u16:
+        sprintf(buf, "%u", value);
         break;
       case s16:
+        sprintf(buf, "%d", (int16_t)value);
         break;
       case special_u8:
+        sprintf(buf, "XXX/%u", value & 0x00FF);
         break;
       case flag8_:
+        sprintf(buf, "%02x", value >> 16);
         break;
       default:
         break;
       }
-      return "";
+      return buf;
     }
   };
 

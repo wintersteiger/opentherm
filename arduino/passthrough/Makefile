@@ -7,6 +7,9 @@ all:
 upload:
 	arduino-cli upload --fqbn $(FQBN) -p $(PORT)
 
+readlog: readlog.cpp
+	${CXX} ${CXXFLAGS} -g -I ../../include -o $@ $^
+
 install-deps:
 	arduino-cli core install arduino:avr
 	arduino-cli lib install FreeRTOS
