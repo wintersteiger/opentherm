@@ -30,7 +30,7 @@ static int uart_putchar(char c, FILE *stream)
   return 0;
 }
 
-void vlog(const char *fmt, va_list args) {
+void vllog(const char *fmt, va_list args) {
   if (log_mtx)
     xSemaphoreTake(log_mtx, portMAX_DELAY);
   printf("[%010lu] ", micros());
@@ -41,10 +41,10 @@ void vlog(const char *fmt, va_list args) {
     xSemaphoreGive(log_mtx);
 }
 
-void log(const char *fmt, ...) {
+void llog(const char *fmt, ...) {
   va_list args;
   va_start(args, fmt);
-  vlog(fmt, args);
+  vllog(fmt, args);
   va_end(args);
 }
 
@@ -57,15 +57,16 @@ public:
 
   virtual void start() override {}
 
-  virtual void process(const Frame &f) override {
+  virtual bool process(const Frame &f) override {
     uint32_t msg = (uint32_t)f;
     char buf[32];
     sprintf(buf, "%08lx", msg);
     io.log("%s: %s", name, buf);
+    return true;
   }
 
   virtual RequestID tx(const Frame & f, bool skip_if_busy = false,
-    void (*callback)(Application*, RequestStatus, const Frame &) = nullptr,
+    void (*callback)(Application*, RequestStatus, RequestID, const Frame &) = nullptr,
     Application *app = nullptr) override {}
 
 protected:
@@ -118,7 +119,7 @@ void setup()
   fdev_setup_stream(&uartf, uart_putchar, NULL, _FDEV_SETUP_WRITE);
   stdout = &uartf;
 
-  log("Passthrough starting...");
+  llog("Passthrough starting...");
 
   xTaskCreateStatic(slave_rx_task, "slave_rx_task", 256, NULL, 1, slave_rx_task_stack, &slave_rx_task_buf);
   xTaskCreateStatic(master_rx_task, "master_rx_task", 256, NULL, 1, master_rx_task_stack, &master_rx_task_buf);
@@ -130,7 +131,7 @@ void loop() {}
 
 extern "C" {
   void vAssertCalled(const char* file, int line) {
-    log("%s:%d: ASSERTION FAILED", file, line);
+    llog("%s:%d: ASSERTION FAILED", file, line);
     fflush(stdout);
     // taskDISABLE_INTERRUPTS();
     // for( ;; );

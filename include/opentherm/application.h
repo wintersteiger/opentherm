@@ -1,7 +1,10 @@
 #ifndef _OPENTHERM_DATA_H_
 #define _OPENTHERM_DATA_H_
 
-#include <opentherm/transport.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "transport.h"
 
 // OpenTherm 2.2 application layer
 
@@ -9,12 +12,6 @@ namespace OpenTherm {
 
 class Application {
 public:
-  Application(DeviceBase &device) : device(device) {
-    // device.set_frame_callback(sprocess, this);
-  }
-
-  virtual ~Application() = default;
-
   enum RWSpec : uint8_t { RO, WO, RW };
 
   enum Type : uint8_t {
@@ -36,15 +33,30 @@ public:
     const char *description;
   };
 
+  Application(DeviceBase &device, IDMeta *idmeta = nullptr)
+      : device(device), index_size(0), idmeta(idmeta) {
+    // device.set_frame_callback(sprocess, this);
+  }
+
+  virtual ~Application() = default;
+
+  struct ID;
+  struct IDIndex {
+    uint8_t id;
+    ID *state;
+  };
+
   struct ID {
     ID() = default;
 
     ID(uint8_t nr, RWSpec msg, const char *data_object, Type type,
-       const char *description, ID *index[256], IDMeta *meta)
-        : value(0)
-    {
-      index[nr] = this;
-      meta[nr] = IDMeta{msg, data_object, type, description};
+       const char *description, IDIndex *index, size_t &index_size,
+       IDMeta *meta = nullptr)
+        : value(0) {
+      if (meta)
+        meta[nr] = IDMeta{msg, data_object, type, description};
+      index[index_size] = {.id = nr, .state = this};
+      index_size++;
     }
 
     virtual ~ID() = default;
@@ -53,6 +65,11 @@ public:
 
     ID &operator=(uint16_t v) {
       value = v;
+      return *this;
+    }
+
+    ID &operator=(float v) {
+      value = v / 256.0;
       return *this;
     }
 
@@ -74,7 +91,8 @@ public:
         snprintf(buf, sizeof(buf), "%u/%u", value >> 8, value & 0x00FF);
         break;
       case s8_s8:
-        snprintf(buf, sizeof(buf), "%d/%d", (int8_t)(value >> 8), (int8_t)value);
+        snprintf(buf, sizeof(buf), "%d/%d", (int8_t)(value >> 8),
+                 (int8_t)value);
         break;
       case u16:
         snprintf(buf, sizeof(buf), "%u", value);
@@ -96,12 +114,18 @@ public:
     }
   };
 
+  virtual void run() = 0;
+
+protected:
   DeviceBase &device;
-  ID *index[256];
-  static IDMeta idmeta[256];
+
+  IDIndex index[59];
+  size_t index_size;
+
+  IDMeta *idmeta = nullptr;
 
 #define DID(NR, MSG, FNAME, OBJECT, TYPE, DESC)                                \
-  ID FNAME = ID(NR, MSG, OBJECT, TYPE, DESC, index, &idmeta[0]);
+  ID FNAME = ID(NR, MSG, OBJECT, TYPE, DESC, index, index_size, idmeta);
 
   // Ids 0 .. 127 are reserved for OpenTherm pre-defined information, while
   // id’s from 128 .. 255 can be used by manufacturers (members of the
@@ -109,21 +133,21 @@ public:
 
   // clang-format off
   DID(  0, RO, status, "Status", flag8_flag8, "Master and Slave Status flags.");
-  DID(  1, WO, tset, "TSet", F88, "Control setpoint ie CH water temperature setpoint (°C)");
+  DID(  1, WO, tset, "TSet", F88, "Control setpoint, i.e. CH water temperature setpoint (°C)");
   DID(  2, WO, mconfig_mmemberid, "M-Config / M-MemberIDcode", flag8_u8, "Master Configuration Flags / Master MemberID Code");
   DID(  3, RO, sconfig_smemberid, "S-Config / S-MemberIDcode", flag8_u8, "Slave Configuration Flags / Slave MemberID Code");
   DID(  4, WO, command, "Command", u8_u8, "Remote Command");
   DID(  5, RO, asf_flags, "ASF-flags / OEM-fault-code", flag8_u8, "Application-specific fault flags and OEM fault code");
   DID(  6, RO, rbp_flags, "RBP-flags", flag8_flag8, "Remote boiler parameter transfer-enable & read/write flags");
   DID(  7, WO, cooling_protocol, "Cooling-control", F88, "Cooling control signal (%)");
-  DID(  8, WO, tsetch2, "TsetCH2", F88, "Control setpoint for 2^e CH circuit (°C)");
+  DID(  8, WO, tsetch2, "TsetCH2", F88, "Control setpoint for 2nd CH circuit (°C)");
   DID(  9, RO, troverride, "TrOverride", F88, "Remote override room setpoint");
   DID( 10, RO, tsp, "TSP", u8_u8, "Number of Transparent-Slave-Parameters supported by slave");
   DID( 11, RW, tsp_index_value, "TSP-index / TSP-value", u8_u8, "Index number / Value of referred-to transparent slave parameter.");
   DID( 12, RO, fhb_size, "FHB-size", u8_u8, "Size of Fault-History-Buffer supported by slave");
   DID( 13, RO, fhb_index_value, "FHB-index / FHB-value", u8_u8, "Index number / Value of referred-to fault-history buffer entry.");
   DID( 14, WO, max_rel_mod_level_setting, "Max-rel-mod-level-setting", F88, "Maximum relative modulation level setting (%)");
-  DID( 15, RO, max_capacity_min_mod_level, "Max-Capacity / Min-Mod-Level", u8_u8, "Maximum boiler capacity (kW) / Minimum boiler modulation level(%)");
+  DID( 15, RO, max_capacity_min_mod_level, "Max-Capacity / Min-Mod-Level", u8_u8, "Maximum boiler capacity (kW) / Minimum boiler modulation level (%)");
   DID( 16, WO, trset, "TrSet", F88, "Room Setpoint (°C)");
   DID( 17, RO, rel_mod_level, "Rel.-mod-level", F88, "Relative Modulation Level (%)");
   DID( 18, RO, ch_pressure, "CH-pressure", F88, "Water pressure in CH circuit (bar)");
@@ -170,11 +194,16 @@ public:
   DID( 38, RW, humidity, "Humidity", s16, "Relative Humidity");
   // clang-format on
 
-  virtual void run() = 0;
+  virtual ID *find(uint8_t id) const {
+    for (auto d : index)
+      if (d.id == id)
+        return d.state;
+    return nullptr;
+  }
 
   // Master to Slave
   virtual void on_read(uint8_t data_id, uint16_t data_value = 0x0000) {
-    const ID *id = index[data_id];
+    const ID *id = find(data_id);
     if (id != NULL) {
       // return DATA-INVALID(DATA-ID, DATA-VALUE) if the data ID is recognised
       // but the data requested is not available or invalid. DATA-VALUE can be
@@ -185,7 +214,7 @@ public:
   }
 
   virtual void on_write(uint8_t data_id, uint16_t data_value) {
-    ID *id = index[data_id];
+    ID *id = find(data_id);
     if (id != NULL) {
       id->value = data_value;
       device.tx(Frame(WriteACK, data_id, data_value));
@@ -194,7 +223,7 @@ public:
   }
 
   virtual void on_invalid_data(uint8_t data_id, uint16_t data_value) {
-    const ID *id = index[data_id];
+    const ID *id = find(data_id);
     if (id != NULL)
       device.tx(Frame(DataInvalid, data_id, data_value));
     else
@@ -208,33 +237,46 @@ public:
   virtual void on_unknown_data_id(uint8_t data_id, uint16_t data_value) {}
 
 protected:
-  virtual void process(const Frame &f) {
+  virtual bool process(const Frame &f) {
     switch (f.msg_type()) {
     case ReadData:
       on_read(f.id(), f.value());
-      break;
+      return true;
     case WriteData:
       on_write(f.id(), f.value());
-      break;
+      return true;
     case InvalidData:
       on_invalid_data(f.id(), f.value());
-      break;
+      return true;
     case ReadACK:
       on_read_ack(f.id(), f.value());
-      break;
+      return true;
     case WriteACK:
       on_write_ack(f.id(), f.value());
-      break;
+      return true;
     case DataInvalid:
       on_data_invalid(f.id(), f.value());
-      break;
+      return true;
     case UnknownDataID:
       on_unknown_data_id(f.id(), f.value());
-      break;
+      return true;
     }
+
+    return false;
   }
 
-  static void sprocess(Application &app, const Frame &f) { app.process(f); }
+  static bool sprocess(Application &app, const Frame &f) {
+    return app.process(f);
+  }
+};
+
+class RichApplication : public Application {
+public:
+  RichApplication(DeviceBase &device) : Application(device, idmeta) {}
+
+  virtual ~RichApplication() = default;
+
+  IDMeta idmeta[256];
 };
 
 } // namespace OpenTherm

@@ -18,7 +18,7 @@
 
 namespace OpenTherm {
 
-class Frame;
+struct Frame;
 class Application;
 
 class BinarySemaphore {
@@ -121,6 +121,11 @@ struct Frame {
 
   Frame(uint32_t data) : data(data) {}
 
+  Frame(MsgType msg_type, uint8_t id) {
+    data = (static_cast<uint32_t>(msg_type) << 28) |
+           (static_cast<uint32_t>(id) << 16);
+  }
+
   Frame(MsgType msg_type, uint8_t id, uint16_t value) {
     data = (static_cast<uint32_t>(msg_type) << 28) |
            (static_cast<uint32_t>(id) << 16) | value;
@@ -130,6 +135,12 @@ struct Frame {
     data = (static_cast<uint32_t>(msg_type) << 28) |
            (static_cast<uint32_t>(id) << 16) |
            (static_cast<uint32_t>(db1) << 8) | db2;
+  }
+
+  Frame(MsgType msg_type, uint8_t id, float value) {
+    data = (static_cast<uint32_t>(msg_type) << 28) |
+           (static_cast<uint32_t>(id) << 16) |
+           ((uint16_t) (value * 256.0));
   }
 
   bool parity() const { return data >> 31 != 0; }
@@ -180,7 +191,7 @@ enum class RequestStatus { OK = 0, TIMED_OUT, SKIPPED, ERROR, PENDING };
 
 struct Request {
   Request(RequestID id = NoRequestID, bool skip_if_busy = false, Frame f = {0},
-          void (*callback)(Application *, RequestStatus,
+          void (*callback)(Application *, RequestStatus, RequestID,
                            const Frame &) = nullptr,
           Application *app = nullptr)
       : id(id), skip_if_busy(skip_if_busy), f(f), callback(callback),
@@ -190,7 +201,7 @@ struct Request {
   RequestID id = NoRequestID;
   bool skip_if_busy = false;
   Frame f = {0};
-  void (*callback)(Application *, RequestStatus, const Frame &) = nullptr;
+  void (*callback)(Application *, RequestStatus, RequestID, const Frame &) = nullptr;
   Application *application = nullptr;
 };
 
@@ -205,18 +216,18 @@ public:
   DeviceBase() = default;
   virtual ~DeviceBase() = default;
 
-  virtual void set_frame_callback(void (*cb)(Application &, const Frame &),
+  virtual void set_frame_callback(bool (*cb)(Application &, const Frame &),
                                   Application *obj) {
     frame_callback = cb;
     frame_callback_obj = obj;
   }
 
   virtual RequestID tx(const Frame &f, bool skip_if_busy = false,
-                       void (*callback)(Application *, RequestStatus,
+                       void (*callback)(Application *, RequestStatus, RequestID rid,
                                         const Frame &) = nullptr,
                        Application *app = nullptr) = 0;
 
-  virtual void process(const Frame &f) {
+  virtual bool process(const Frame &f) {
     if (f.parity_ok()) {
       switch (f.msg_type()) {
       case ReadData:
@@ -226,23 +237,22 @@ public:
       case WriteACK:
       case DataInvalid:
       case UnknownDataID:
-        break;
+        if (frame_callback && frame_callback_obj)
+          return frame_callback(*frame_callback_obj, f);
       default:
-        printf("unexpected message type: %d", f.msg_type());
+        return false;
       }
-      if (frame_callback && frame_callback_obj)
-        frame_callback(*frame_callback_obj, f);
-    } else
-      printf("parity not ok: %08x", f.data);
+    }
+    return false;
   }
 
 protected:
-  void (*frame_callback)(Application &, const Frame &) = nullptr;
+  bool (*frame_callback)(Application &, const Frame &) = nullptr;
   Application *frame_callback_obj = nullptr;
 };
 
 template <typename TimerType, typename SemaphoreType, typename TimeType,
-          template <typename> typename QueueType, typename IOType,
+          template <typename> class QueueType, typename IOType,
           size_t max_concurrent_requests = 16>
 class Device : public DeviceBase {
 public:
@@ -272,7 +282,8 @@ public:
       Frame f = rx_once();
       if (blink)
         blink(true);
-      process(f);
+      if (!process(f))
+        io.log("Dev: frame processing failed: %08lx", (uint32_t)f);
       if (blink)
         blink(false);
     }
@@ -280,7 +291,7 @@ public:
 };
 
 template <typename TimerType, typename SemaphoreType, typename TimeType,
-          template <typename> typename QueueType, typename IOType,
+          template <typename> class QueueType, typename IOType,
           size_t max_concurrent_requests = 16>
 class Master : public Device<TimerType, SemaphoreType, TimeType, QueueType,
                              IOType, max_concurrent_requests> {
@@ -403,7 +414,7 @@ public:
     return acquired;
   }
 
-  virtual void process(const Frame &f) override {
+  virtual bool process(const Frame &f) override {
     if (f.parity_ok()) {
       switch (f.msg_type()) {
       case ReadACK:
@@ -413,15 +424,17 @@ public:
         break;
       default:
         io.log("unexpected message type: %d", f.msg_type());
+        return false;
       }
       if (frame_callback && frame_callback_obj)
-        frame_callback(*frame_callback_obj, f);
+        return frame_callback(*frame_callback_obj, f);
     } else
-      io.log("Master: parity not ok: %08x", f.data);
+      io.log("Master: parity check failed: %08x", f.data);
+    return false;
   }
 
   virtual RequestID tx(const Frame &f, bool skip_if_busy = false,
-                       void (*callback)(Application *, RequestStatus,
+                       void (*callback)(Application *, RequestStatus, RequestID,
                                         const Frame &) = nullptr,
                        Application *app = nullptr) override {
     if (next_request_id == NoRequestID)
@@ -454,7 +467,6 @@ public:
   }
 
   void tx_forever() {
-    Frame reply;
     while (true) {
       auto req = requests.remove();
 
@@ -467,7 +479,7 @@ public:
         r.status = RequestStatus::OK;
 
       if (req.callback && req.application)
-        req.callback(req.application, r.status, r.f);
+        req.callback(req.application, r.status, r.id, r.f);
     }
   }
 
@@ -481,7 +493,7 @@ protected:
 };
 
 template <typename TimerType, typename SemaphoreType, typename TimeType,
-          template <typename> typename QueueType, typename IOType,
+          template <typename> class QueueType, typename IOType,
           size_t max_concurrent_requests = 16>
 class Slave : public Device<TimerType, SemaphoreType, TimeType, QueueType,
                             IOType, max_concurrent_requests> {
@@ -501,22 +513,25 @@ public:
 
   virtual void start() override {}
 
-  virtual void process(const Frame &f) override {
+  virtual bool process(const Frame &f) override {
     if (frame_callback && f.parity_ok()) {
       switch (f.msg_type()) {
       case ReadData:
       case WriteData:
       case InvalidData:
-        frame_callback(*frame_callback_obj, f);
-        break;
+        return frame_callback(*frame_callback_obj, f);
       default:
         io.log("unexpected message type: %d", f.msg_type());
+        return false;
       }
     }
+    else
+      io.log("Slave: parity check failed: %08x", f.data);
+    return false;
   }
 
   virtual RequestID tx(const Frame &f, bool skip_if_busy = false,
-                       void (*callback)(Application *, RequestStatus,
+                       void (*callback)(Application *, RequestStatus, RequestID,
                                         const Frame &) = nullptr,
                        Application *app = nullptr) override {
     io.send(f);

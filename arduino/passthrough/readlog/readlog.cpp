@@ -3,6 +3,9 @@
 #include <iostream>
 #include <unordered_set>
 
+#include <pqxx/pqxx>
+#include <pqxx/except.hxx>
+
 #include <opentherm/transport.h>
 #include <opentherm/application.h>
 
