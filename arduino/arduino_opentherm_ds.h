@@ -1,10 +1,19 @@
 #ifndef _ARDUINO_DATA_STRUCTURES_H_
 #define _ARDUINO_DATA_STRUCTURES_H_
 
+#include <limits.h>
+
+#include "FreeRTOSConfig.h"
+
+#include <Arduino_FreeRTOS.h>
+#include <task.h>
+#include <semphr.h>
+#include <timers.h>
+
 #include <opentherm/transport.h>
 
-extern void log(const char*, ...);
-extern void vlog(const char *fmt, va_list args);
+extern void llog(const char*, ...);
+extern void vllog(const char *fmt, va_list args);
 
 class ArduinoTimer : public OpenTherm::Timer {
 public:
@@ -14,19 +23,19 @@ public:
                callback_t fstop = nullptr, void *data = nullptr)
       : OpenTherm::Timer(delay_us, period_us, ftick, fstop, data) {
     if (!(t = xTimerCreateStatic("timer", pdMS_TO_TICKS(period_us)/1000, pdTRUE, this, pcb, &state)))
-      log("xTimerCreate failed");
+      llog("xTimerCreate failed");
   }
 
   virtual ~ArduinoTimer() = default;
 
   virtual void start(uint64_t delay_us = 0) override {
     if (xTimerStart(t, 0) == pdFAIL)
-      log("xTimerStart failed");
+      llog("xTimerStart failed");
   }
 
   virtual void stop(bool run_fstop = true) override {
     if (xTimerStop(t, 0) == pdFAIL)
-      log("xTimerStop failed");
+      llog("xTimerStop failed");
   }
 
 protected:
@@ -43,7 +52,7 @@ class ArduinoSemaphore : public OpenTherm::BinarySemaphore {
 public:
   ArduinoSemaphore() : OpenTherm::BinarySemaphore() {
     if (!(s = xSemaphoreCreateBinaryStatic(&state)))
-      log("xSemaphoreCreateCounting failed");
+      llog("xSemaphoreCreateCounting failed");
     xSemaphoreGive(s);
   }
   virtual ~ArduinoSemaphore() = default;
@@ -74,7 +83,7 @@ public:
 
   ArduinoQueue(size_t size = queue_size) : OpenTherm::Queue<T>(size) {
     if (!(q = xQueueCreateStatic(size, sizeof(T), storage, &state)))
-      log("xQueueCreate failed");
+      llog("xQueueCreate failed");
   }
   virtual ~ArduinoQueue() { vQueueDelete(q); }
 
@@ -113,7 +122,7 @@ public:
   virtual void log(const char *fmt, ...) override {
     va_list args;
     va_start(args, fmt);
-    ::vlog(fmt, args);
+    ::vllog(fmt, args);
     va_end(args);
   }
 
@@ -178,7 +187,7 @@ protected:
         break;
       case START:
         if (delta > 750) {
-          ::log("frame dropped in START: %d", delta);
+          llog("frame dropped in START: %dus", delta);
           io->rx_state = IDLE;
         }
         else if (!rising) {
@@ -191,7 +200,7 @@ protected:
         break;
       case DATA:
         if (delta > 1500) {
-          ::log("frame dropped in DATA: %08x", io->frame);
+          llog("frame dropped in DATA: %08x", io->frame);
           io->rx_state = IDLE;
           io->prev_time = time;
         }
@@ -205,7 +214,7 @@ protected:
         break;
       case STOP:
         if (delta > 1500 || (delta > 750 && rising) || (delta <= 750 && !rising)) {
-          ::log("frame dropped in STOP: %08x", io->frame);
+          llog("frame dropped in STOP: %08x", io->frame);
           io->rx_state = IDLE;
         }
         else
@@ -215,7 +224,7 @@ protected:
       case COMPLETE:
         break;
       default:
-        ::log("unknown RX state: %d", io->rx_state);
+        llog("unknown RX state: %d", io->rx_state);
         io->rx_state = IDLE;
         io->prev_time = time;
     }

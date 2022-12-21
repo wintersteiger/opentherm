@@ -1,3 +1,5 @@
+#include <stdio.h>
+
 #include <boards/pico_w.h>
 
 #include <hardware/adc.h>
@@ -6,14 +8,15 @@
 #include <hardware/pll.h>
 #include <pico/cyw43_arch.h>
 #include <pico/multicore.h>
+#include <pico/mutex.h>
 #include <pico/stdlib.h>
 #include <pico/unique_id.h>
 
 #include <lwip/apps/fs.h>
 #include <lwip/apps/httpd.h>
 #include <lwip/apps/mqtt.h>
-#include <lwip/tcpip.h>
 #include <lwip/stats.h>
+#include <lwip/tcpip.h>
 
 #include <opentherm/application.h>
 #include <opentherm/transport.h>
@@ -23,7 +26,6 @@
 using namespace OpenTherm;
 
 alarm_pool_t *PicoTimer::alarm_pool = NULL;
-Application::IDMeta Application::idmeta[256] = {0};
 
 auto_init_recursive_mutex(log_mtx);
 
@@ -60,18 +62,80 @@ static void hard_fault_exception_handler(void) {
 class MyDevice
     : public Master<PicoTimer, PicoSemaphore, PicoTime, PicoQueue, PicoIO> {
 public:
-  MyDevice(const Pins &pins) : Master(pins) {}
+  enum State { INIT, SLAVE_DATA, NORMAL };
+  State state = INIT;
+
+  MyDevice(const Pins &pins) : Master(pins), state(INIT) {}
   virtual ~MyDevice() = default;
 
-  virtual void next_master_msg() override {
-    tx(Frame(OpenTherm::MsgType::ReadData, 0x00, status, 0x00), true);
+  Frame init_master_frames[2] = {Frame(ReadData, 0), Frame(ReadData, 3)};
+
+  Frame slave_data_frames[7] = {
+      Frame(ReadData, 3),   Frame(ReadData, 124), Frame(ReadData, 125),
+      Frame(ReadData, 126), Frame(ReadData, 127), Frame(ReadData, 57),
+      Frame(WriteData, 1, 80.0f)};
+
+  Frame master_frames[11] = {
+      Frame(ReadData, 0),  Frame(ReadData, 10), Frame(ReadData, 15),
+      Frame(ReadData, 18), Frame(ReadData, 19), Frame(ReadData, 25),
+      Frame(ReadData, 26), Frame(ReadData, 28), Frame(ReadData, 33),
+      Frame(ReadData, 35), Frame(WriteData, 1)};
+
+  void advance() {
+    switch (state) {
+    case INIT:
+      state = SLAVE_DATA;
+      next_frame_index = 0;
+      break;
+    case SLAVE_DATA:
+      if (next_frame_index == 0) {
+        llog("entering normal operation");
+        state = NORMAL;
+        next_frame_index = 0;
+      }
+      break;
+    case NORMAL:
+      break;
+    }
   }
+
+  virtual void next_master_msg() override {
+    Frame f;
+
+    switch (state) {
+    case INIT:
+      f = init_master_frames[next_frame_index];
+      next_frame_index = (next_frame_index + 1) % 2;
+      break;
+    case SLAVE_DATA:
+      f = slave_data_frames[next_frame_index];
+      next_frame_index = (next_frame_index + 1) % 7;
+      break;
+    case NORMAL: {
+      f = master_frames[next_frame_index];
+      next_frame_index = (next_frame_index + 1) % 10;
+    }
+    }
+
+    if (f.id() == 0)
+      tx(Frame(ReadData, f.id(), status, 0x00), true);
+    else if (f.id() == 1)
+      tx(Frame(ReadData, f.id(), current_setpoint), true);
+    else
+      tx(f, true);
+  }
+
+protected:
+  size_t next_frame_index = 0;
+  float current_setpoint = 0.0;
 };
 
-class MyApp : public Application {
+class MyApp : public RichApplication {
 public:
+  using RichApplication::idmeta;
+
   MyApp(const Pins &pins)
-      : Application(device), device(pins),
+      : RichApplication(device), device(pins),
         wifi_link_timer(0, 1000000, on_wifi_link_timer_cb, nullptr, this) {
     device.set_frame_callback(Application::sprocess, this);
     mutex_init(&mqtt_mtx);
@@ -100,15 +164,16 @@ public:
   virtual void on_read_ack(uint8_t data_id, uint16_t data_value) override {
     ::llog("Read-Ack(%d, %04x)", data_id, data_value);
     Application::on_read_ack(data_id, data_value);
-    slave_data[data_id].seen = true;
-    slave_data[data_id].value = data_value;
+    slave_state[data_id].seen = true;
+    slave_state[data_id].value = data_value;
+    device.advance();
   }
 
   virtual void on_write_ack(uint8_t data_id, uint16_t data_value) override {
     ::llog("Write-Ack(%d, %04x)", data_id, data_value);
     Application::on_write_ack(data_id, data_value);
-    slave_data[data_id].seen = true;
-    slave_data[data_id].value = data_value;
+    slave_state[data_id].seen = true;
+    slave_state[data_id].value = data_value;
   }
 
   virtual void on_data_invalid(uint8_t data_id, uint16_t data_value) override {
@@ -124,14 +189,16 @@ public:
 
   virtual RequestID tx(const Frame &f, bool skip_if_busy = false,
                        void (*callback)(Application *, RequestStatus,
+                                        RequestID rid,
                                         const Frame &) = nullptr) {
     return device.tx(f, skip_if_busy, callback, this);
   }
 
   MyDevice &dev() { return device; }
 
-  virtual void process(const Frame &f) override {
-    Application::process(f);
+  virtual bool process(const Frame &f) override {
+    if (!Application::process(f))
+      return false;
 
     char payload[9];
     int len = snprintf(payload, sizeof(payload), "%08lx", (uint32_t)f);
@@ -141,12 +208,14 @@ public:
           mqtt_publish(mqtt_client, mqtt_topic, payload, len, 0, 0, NULL, NULL);
       if (err != ERR_OK) {
         llog("App: mqtt_publish err=%d", err);
-        llog("App: lwIP stats: %lu %lu %lu %lu %lu", lwip_stats.mem.err, lwip_stats.mem.avail, lwip_stats.mem.used, lwip_stats.mem.max, lwip_stats.mem.illegal);
+        llog("App: lwIP stats: %lu %lu %lu %lu %lu", lwip_stats.mem.err,
+             lwip_stats.mem.avail, lwip_stats.mem.used, lwip_stats.mem.max,
+             lwip_stats.mem.illegal);
       }
     }
     mutex_exit(&mqtt_mtx);
 
-    // stats_display();
+    return true;
   }
 
   void rx_forever() {
@@ -155,15 +224,14 @@ public:
     });
   }
 
-  void tx_forever() {
-    device.tx_forever();
-  }
+  void tx_forever() { device.tx_forever(); }
 
-  struct SlaveData {
+  struct SlaveState {
     bool seen = false;
     uint16_t value = 0;
   };
-  SlaveData slave_data[256] = {0};
+
+  SlaveState slave_state[256] = {{0}};
 
 protected:
   MyDevice device;
@@ -176,8 +244,15 @@ protected:
       "OpenThermOstat/command/out";
   mutex_t mqtt_mtx;
 
-  bool mosq_cmd_triggered;
-  char mosq_cmd_hex[9];
+  struct MQTTRequest {
+    RequestID rid = NoRequestID;
+    uint16_t user_id = 0;
+  };
+
+  static constexpr const size_t mqtt_max_concurrent_requests = 16;
+  MQTTRequest mqtt_requests[mqtt_max_concurrent_requests];
+  size_t mqtt_num_active_requests = 0;
+  char mosq_cmd_hex[13 * mqtt_max_concurrent_requests];
   size_t mosq_data_arrived;
 
   static void on_mqtt_publish_cb(void *arg, const char *topic, u32_t tot_len) {
@@ -186,14 +261,8 @@ protected:
   }
 
   void on_mqtt_publish(const char *topic, u32_t tot_len) {
-    if (strcmp(topic, mqtt_cmd_in_topic) == 0) {
-      if (mosq_cmd_triggered) {
-        llog("error: busy with previous command");
-        return;
-      }
-      mosq_cmd_triggered = true;
-      mosq_data_arrived = 0;
-    }
+    // if (strcmp(topic, mqtt_cmd_in_topic) == 0) {}
+    // llog("on_mqtt_publish: tot_len=%lu", tot_len);
   }
 
   static void on_mqtt_data_cb(void *arg, const u8_t *data, u16_t len,
@@ -203,67 +272,89 @@ protected:
   }
 
   void on_mqtt_data(const u8_t *data, u16_t len, u8_t flags) {
-    if (mosq_cmd_triggered) {
-      for (uint16_t i = 0; i < len; i++) {
-        mosq_cmd_hex[mosq_data_arrived++] = data[i];
-        if (mosq_data_arrived >= 8) {
-          mosq_cmd_hex[mosq_data_arrived] = 0;
-          break;
+    for (uint16_t i = 0; i < len && mosq_data_arrived < sizeof(mosq_cmd_hex);
+         i++) {
+      mosq_cmd_hex[mosq_data_arrived++] = data[i];
+      if (mosq_data_arrived >= 12) {
+        mosq_cmd_hex[mosq_data_arrived] = 0;
+        break;
+      }
+    }
+    while (mosq_data_arrived >= 12) {
+      uint16_t user_id = 0;
+      uint32_t req_msg = 0;
+      if (sscanf(mosq_cmd_hex, "%04hx%08lx", &user_id, &req_msg) != 2)
+        llog("error: invalid MQTT input; not a hex-encoded request ID and "
+             "OpenTherm frame");
+      else {
+        if (mqtt_num_active_requests >= mqtt_max_concurrent_requests)
+          llog("error: too many MQTT requests");
+        else {
+          RequestID rid =
+              tx(req_msg, false,
+                 [](Application *a, RequestStatus s, RequestID rid,
+                    const Frame &f) {
+                   MyApp *app = static_cast<MyApp *>(a);
+                   auto &req =
+                       app->mqtt_requests[rid % mqtt_max_concurrent_requests];
+                   if (req.rid != rid)
+                     llog("warning: outdated MQTT request ID");
+                   else {
+                     req.rid = NoRequestID;
+                     app->mqtt_publish_cmd_response(s, req.user_id, f);
+                     app->mqtt_num_active_requests--;
+                   }
+                 });
+
+          if (rid == NoRequestID)
+            llog("error: failure to submit MQTT request (the queue is likely "
+                 "full)");
+          else {
+            mqtt_requests[rid % mqtt_max_concurrent_requests] = {
+                .rid = rid, .user_id = user_id};
+            mqtt_num_active_requests++;
+          }
         }
       }
-      if (mosq_data_arrived >= 8) {
-        uint32_t req_msg;
-        if (sscanf(mosq_cmd_hex, "%08lx", &req_msg) != 1) {
-          llog("error: invalid input; not a hex-encoded OpenTherm frame");
-          return;
-        }
 
-        Frame rsp;
-        RequestID rid = tx(req_msg, false,
-                           [](Application *a, RequestStatus s, const Frame &f) {
-                             MyApp *app = static_cast<MyApp *>(a);
-                             app->mqtt_publish_cmd_response(s, f);
-                           });
-
-        if (rid == NoRequestID)
-          llog("error: failure to submit request (queue full)");
-
-        mosq_cmd_triggered = false;
-        mosq_data_arrived = 0;
-      }
+      for (size_t i = 0; i < 12 && i + 12 < sizeof(mosq_cmd_hex); i++)
+        mosq_cmd_hex[i] = mosq_cmd_hex[i + 12];
+      mosq_data_arrived -= 12;
     }
   }
 
-  void mqtt_publish_cmd_response(RequestStatus s, const Frame &f) {
-    char rsp[9] = "";
-    snprintf(rsp, sizeof(rsp), "%08lx", (uint32_t)f);
+  void mqtt_publish_cmd_response(RequestStatus s, uint16_t user_id,
+                                 const Frame &f) {
+    char rsp[13] = "";
+    snprintf(rsp, sizeof(rsp), "%04x%08lx", user_id, (uint32_t)f);
 
     mutex_enter_blocking(&mqtt_mtx);
     {
       if (mqtt_client && mqtt_client_is_connected(mqtt_client))
         mqtt_publish(
-            mqtt_client, mqtt_cmd_out_topic, rsp, 8, 0, 0,
+            mqtt_client, mqtt_cmd_out_topic, rsp, 12, 0, 0,
             [](void *arg, err_t err) {
               if (err != ERR_OK)
                 llog("mqtt_publish failed: %d", err);
             },
             NULL);
       else
-        llog("error: mqtt client not connected");
+        llog("error: MQTT client not connected");
     }
     mutex_exit(&mqtt_mtx);
   }
 
   static void on_mqtt_connection_cb(mqtt_client_t *client, void *arg,
-                                 mqtt_connection_status_t status) {
+                                    mqtt_connection_status_t status) {
     MyApp *app = static_cast<MyApp *>(arg);
     app->on_mqtt_connection(client, status);
   }
 
-  void on_mqtt_connection(mqtt_client_t *client, mqtt_connection_status_t status) {
-    llog("mqtt connection status: %d", status);
+  void on_mqtt_connection(mqtt_client_t *client,
+                          mqtt_connection_status_t status) {
+    llog("MQTT connection status: %d", status);
     if (status == MQTT_CONNECT_DISCONNECTED || status == MQTT_CONNECT_TIMEOUT) {
-      llog("mqtt reconnecting");
+      llog("MQTT reconnecting");
       mutex_enter_blocking(&mqtt_mtx);
       {
         if (mqtt_client)
@@ -276,7 +367,6 @@ protected:
   }
 
   void mqtt_init() {
-    mosq_cmd_triggered = false;
     mosq_data_arrived = 0;
 
     mqtt_client_info.client_id = "OpenThermOstat";
@@ -297,13 +387,14 @@ protected:
       mqtt_client = mqtt_client_new();
 
       if (!mqtt_client) {
-        llog("failed to allocate new mqtt client");
+        llog("failed to allocate new MQTT client");
         mutex_exit(&mqtt_mtx);
         return;
       }
 
-      err_t r = mqtt_client_connect(mqtt_client, &ip, port, on_mqtt_connection_cb,
-                                    this, &mqtt_client_info);
+      err_t r =
+          mqtt_client_connect(mqtt_client, &ip, port, on_mqtt_connection_cb,
+                              this, &mqtt_client_info);
       if (r != ERR_OK) {
         llog("mqtt_client_connect failed: %d", r);
         mutex_exit(&mqtt_mtx);
@@ -333,12 +424,12 @@ protected:
   bool wifi_link_down = true;
   PicoTimer wifi_link_timer;
 
-  static bool on_wifi_link_timer_cb(OpenTherm::Timer *timer, void *obj) {
+  static bool on_wifi_link_timer_cb(Timer *timer, void *obj) {
     MyApp *app = static_cast<MyApp *>(obj);
     return app->on_wifi_link_timer(timer);
   };
 
-  bool on_wifi_link_timer(OpenTherm::Timer *) {
+  bool on_wifi_link_timer(Timer *) {
     int ws = cyw43_wifi_link_status(&cyw43_state, 0);
     int ts = cyw43_tcpip_link_status(&cyw43_state, 0);
     if (wifi_link_down)
@@ -361,11 +452,8 @@ protected:
       return false;
     }
 
-    cyw43_wifi_pm(&cyw43_state, CYW43_AGGRESSIVE_PM);
-    // gpio_put(CYW43_PIN_WL_REG_ON, 0);
-    // cyw43_arch_gpio_put(1, 0);
-
     llog("Connecting to '%s'", WIFI_SSID);
+    cyw43_wifi_pm(&cyw43_state, CYW43_AGGRESSIVE_PM);
     cyw43_arch_enable_sta_mode();
     wifi_link_timer.start();
 
@@ -376,7 +464,7 @@ protected:
 MyApp app({.rx = 27, .tx = 26, .owned = true});
 
 extern "C" {
-#define MAX_RESPONSE_SIZE 1024
+#define MAX_RESPONSE_SIZE 3 * 1024
 
 struct FSCustomData {
   uint64_t request_id = -1;
@@ -393,7 +481,8 @@ static int make_http_response(char *state, FSCustomData *data) {
     Frame response;
     switch (app.dev().get(data->request_id, response)) {
     case RequestStatus::OK:
-      sz = snprintf(data->lbuf, sizeof(data->lbuf), "%08lx", (uint32_t)response);
+      sz =
+          snprintf(data->lbuf, sizeof(data->lbuf), "%08lx", (uint32_t)response);
       status = "200";
       break;
     case RequestStatus::TIMED_OUT:
@@ -414,15 +503,23 @@ static int make_http_response(char *state, FSCustomData *data) {
 
 size_t make_status_page(char *buf, size_t sz) {
   char *p = buf;
-  p += snprintf(p, sz-(p-buf), "<html>");
-  p += snprintf(p, sz-(p-buf), "<table border=1>");
-  p += snprintf(p, sz-(p-buf), "<tr><th>Data ID</th><th>Value</th></tr>");
-  for (size_t i=0; i < 256; i++)
-    if (app.slave_data[i].seen)
-      p += snprintf(p, sz-(p-buf), "<tr><td>%u</td><td>%04x</td></tr>", i, app.slave_data[i].value);
-  p += snprintf(p, sz-(p-buf), "</table>");
-  p += snprintf(p, sz-(p-buf), "</html>");
-  return p-buf;
+  p += snprintf(p, sz - (p - buf), "<html>");
+  p += snprintf(p, sz - (p - buf), "<table border=1>");
+  p += snprintf(p, sz - (p - buf),
+                "<tr><th>Data "
+                "ID</th><th>Raw</th><th>Value</th><th>Description</th></tr>");
+  for (size_t i = 0; i < 256; i++)
+    if (app.slave_state[i].seen)
+      p += snprintf(
+          p, sz - (p - buf),
+          "<tr><td>%u</td><td>%04x</td><td align=right>%s</td><td>%s</td</tr>",
+          i, app.slave_state[i].value,
+          Application::ID::to_string(app.idmeta[i].type,
+                                     app.slave_state[i].value),
+          app.idmeta[i].description);
+  p += snprintf(p, sz - (p - buf), "</table>");
+  p += snprintf(p, sz - (p - buf), "</html>");
+  return p - buf;
 }
 
 int fs_open_custom(struct fs_file *file, const char *name) {
@@ -521,7 +618,6 @@ void httpd_cgi_handler(struct fs_file *file, const char *uri, int num_params,
                            "'%s' is not a hex-encoded uint32_t", values[i]);
               data->status = "400";
             } else {
-              llog("OpenTherm request: msg=%08x", msg);
               data->request_id = app.tx(Frame(msg));
               if (data->request_id == NoRequestID) {
                 data->lbuf_sz = snprintf(data->lbuf, sizeof(data->lbuf),
@@ -544,8 +640,7 @@ void httpd_cgi_handler(struct fs_file *file, const char *uri, int num_params,
       } else if (strcmp(uri, "/status.ssi") == 0) {
         data->lbuf_sz = make_status_page(data->lbuf, sizeof(data->lbuf));
         data->status = "200";
-      }
-      else
+      } else
         data->status = "404";
     }
   }

@@ -3,6 +3,9 @@
 #include <iostream>
 #include <unordered_set>
 
+#include <pqxx/pqxx>
+#include <pqxx/except.hxx>
+
 #include <opentherm/transport.h>
 #include <opentherm/application.h>
 
@@ -115,6 +118,9 @@ public:
 
 protected:
   MyDevice device;
+
+  pqc = std::make_shared<pqxx::connection>("postgresql://cwinter:UxTCFqbq4Bd3xT1Mq3vC@192.168.0.41/station_house");
+    pqxx::work txn{*pqc};
 };
 
 static MyApp app;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -23,8 +24,6 @@
 using namespace std::chrono_literals;
 using namespace OpenTherm;
 
-Application::IDMeta Application::idmeta[256] = {};
-
 static struct mosquitto *mosq = NULL;
 static std::thread *mosq_thread = nullptr;
 static bool mosq_thread_running = false;
@@ -37,7 +36,7 @@ public:
   virtual ~CLIDevice() = default;
 
   virtual RequestID tx(const Frame &f, bool skip_if_busy = false,
-                       void (*callback)(Application*, RequestStatus,
+                       void (*callback)(Application *, RequestStatus, RequestID,
                                         const Frame &) = nullptr,
                        Application *app = nullptr) override {
     return NoRequestID;
@@ -60,7 +59,8 @@ protected:
 static CLIApp app;
 static auto command_timeout = 2s;
 static std::mutex log_mtx;
-static bool waiting_for_reply = false;
+static volatile uint16_t next_request_id = 0;
+static volatile uint16_t request_id_rcvd = -1;
 static Frame last_frame;
 
 static std::map<std::string,
@@ -142,17 +142,19 @@ std::string to_string(const Frame &f) {
 void mosquitto_msg_callback(mosquitto *mosq, void *arg,
                             const mosquitto_message *msg) {
   const std::lock_guard<std::mutex> lock(log_mtx);
-  if (msg->payloadlen != 8) {
+  if (msg->payloadlen != 12) {
     std::cout << "unknown message of length " << msg->payloadlen << std::endl;
   } else {
+    uint16_t rid = 0;
     uint32_t otmsg = 0;
-    if (sscanf((char *)msg->payload, "%08x", &otmsg) != 1)
-      std::cout << "erroneous message: %s is not a hex-encoded frame"
+    if (sscanf((char *)msg->payload, "%04hx%08x", &rid, &otmsg) != 2)
+      std::cout << "erroneous message: %s is not a hex-encoded request ID and "
+                   "OpenTherm frame"
                 << std::endl;
     else {
       last_frame = Frame(otmsg);
       std::cout << "\r> " << to_string(last_frame) << std::endl;
-      waiting_for_reply = false;
+      request_id_rcvd = rid;
     }
   }
 }
@@ -205,9 +207,10 @@ void send_msg(const Frame &f) {
     const std::lock_guard<std::mutex> lock(log_mtx);
     std::cout << "\r< " << to_string(f) << std::endl;
   }
-  char msg_hex[9];
-  int len = snprintf(msg_hex, sizeof(msg_hex), "%08x", (uint32_t)f);
-  waiting_for_reply = true;
+  char msg_hex[13];
+  uint16_t request_id = next_request_id++;
+  int len =
+      snprintf(msg_hex, sizeof(msg_hex), "%04x%08x", request_id, (uint32_t)f);
   auto before = std::chrono::system_clock::now();
   auto err =
       mosquitto_publish(mosq, NULL, mosq_cmd_in_topic, len, msg_hex, 0, false);
@@ -227,8 +230,7 @@ void send_msg(const Frame &f) {
     pci = (pci + 1) % 4;
     std::cout.flush();
     std::this_thread::sleep_for(100ms);
-  } while (waiting_for_reply);
-  std::cout << "\r";
+  } while (request_id < request_id_rcvd);
 }
 
 void send_msg(Frame &&f) { send_msg(f); }
@@ -274,25 +276,17 @@ static void handle_line(std::string &line, volatile bool &keep_running) {
         if (!cmd) {
           const std::lock_guard<std::mutex> lock(log_mtx);
           std::cout << "\rX unknown command '" << fun_name << "'" << std::endl;
-        } else {
+        } else
           cmd(args);
-        }
       }
     }
   } catch (const std::exception &ex) {
     const std::lock_guard<std::mutex> lock(log_mtx);
-    std::cout << "X exception: " << ex.what() << std::endl;
+    std::cout << "\rX exception: " << ex.what() << std::endl;
   }
 }
 
 void register_cmds() {
-  cmds["echo"] = [](auto &args) {
-    std::cout << "\r  - echo";
-    for (const auto &arg : args)
-      std::cout << " " << arg;
-    std::cout << std::endl;
-  };
-
   cmds["read"] = [](auto &args) {
     if (args.size() != 1)
       throw std::runtime_error("invalid number of arguments");
@@ -317,7 +311,7 @@ void register_cmds() {
 
 void ask_for_input() {
   const std::lock_guard<std::mutex> lock(log_mtx);
-  std::cout << "\r* ";
+  std::cout << "* ";
   std::cout.flush();
 }
 
@@ -339,7 +333,7 @@ int main(int argc, const char **argv) {
           send_msg(from_hex(argv[i]));
         } catch (const std::exception &ex) {
           const std::lock_guard<std::mutex> lock(log_mtx);
-          std::cout << "X Skipping invalid frame '" << argv[i]
+          std::cout << "\rX Skipping invalid frame '" << argv[i]
                     << "': " << ex.what() << std::endl;
         }
       }
@@ -355,10 +349,10 @@ int main(int argc, const char **argv) {
       ask_for_input();
     }
   } catch (const std::exception &ex) {
-    std::cout << "Exception: " << ex.what() << std::endl;
+    std::cout << "\rX Exception: " << ex.what() << std::endl;
     r = 1;
   } catch (...) {
-    std::cout << "Caught unknown exception" << std::endl;
+    std::cout << "\rX Caught unknown exception" << std::endl;
     r = 2;
   }
 
