@@ -194,7 +194,7 @@ protected:
   DID( 38, RW, humidity, "Humidity", s16, "Relative Humidity");
   // clang-format on
 
-  virtual ID *find(uint8_t id) const {
+  virtual ID *find(uint8_t id) {
     for (auto d : index)
       if (d.id == id)
         return d.state;
@@ -276,6 +276,12 @@ public:
 
   virtual ~RichApplication() = default;
 
+  virtual ID *find(uint8_t id) override {
+    return &index[id];
+  }
+
+protected:
+  ID index[256];
   IDMeta idmeta[256];
 };
 
