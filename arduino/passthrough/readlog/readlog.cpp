@@ -11,15 +11,13 @@
 
 using namespace OpenTherm;
 
-Application::IDMeta Application::idmeta[256];
-
 class MyDevice : public DeviceBase {
 public:
   MyDevice() : DeviceBase() {}
   virtual ~MyDevice() = default;
 
   virtual RequestID tx(const Frame &f, bool skip_if_busy = false,
-                       void (*callback)(Application *, RequestStatus,
+                       void (*callback)(Application *, RequestStatus, RequestID,
                                         const Frame &) = nullptr,
                        Application *app = nullptr) override
   {
@@ -28,28 +26,35 @@ public:
 };
 
 
-class MyApp : public Application {
+class MyApp : public RichApplication {
 public:
-  MyApp() : Application(device) {
+  MyApp() : RichApplication(device) {
     device.set_frame_callback(Application::sprocess, this);
+
+    if (const char* cs = std::getenv("PQCONNECTION")) {
+      pqc = std::make_shared<pqxx::connection>(cs);
+
+      pqxx::work tx{*pqc};
+      tx.exec1("CREATE TABLE IF NOT EXISTS boiler (time TIMESTAMPTZ NOT NULL, msg_type bytea NOT NULL, id smallint NOT NULL, value bytea NOT NULL);"
+                "SELECT create_hypertable('boiler','time', if_not_exists => TRUE);");
+      tx.commit();
+    }
   }
 
   virtual ~MyApp() = default;
 
   virtual void run() override {}
 
-  void update(uint8_t id, uint16_t value) {
-    ID* idp = index[id];
-    if (!idp) {
-      idp = new ID();
-      index[id] = idp;
-      idmeta[id] = IDMeta{RWSpec::RW, "unknown", Type::u16, ""};
-    }
-    idp->value = value;
-  }
-
   void dev_process(const Frame &f) {
     device.process(f);
+
+    if (pqc) {
+      pqxx::nontransaction ntx(*pqc);
+      static char msg_type_hex[3], value_hex[5];
+      snprintf(msg_type_hex, sizeof(msg_type_hex), "%02x", f.msg_type());
+      snprintf(value_hex, sizeof(value_hex), "%04x", f.value());
+      ntx.exec0(std::string("INSERT INTO boiler VALUES(NOW(), '\\x") + msg_type_hex + "', " + std::to_string(f.id()) + ", '\\x" + value_hex + "');");
+    }
   }
 
   bool outp = false;
@@ -77,7 +82,7 @@ public:
     Application::on_read_ack(id, value);
     if (outp)
     {
-      Application::ID *idp = index[id];
+      Application::ID *idp = find(id);
       if (!idp)
         printf("unknown data ID");
       else
@@ -104,7 +109,7 @@ public:
     Application::on_write_ack(id, value);
     if (outp)
     {
-      Application::ID *idp = index[id];
+      Application::ID *idp = find(id);
       if (!idp)
         printf("unknown data ID");
       else
@@ -119,8 +124,7 @@ public:
 protected:
   MyDevice device;
 
-  pqc = std::make_shared<pqxx::connection>("postgresql://cwinter:UxTCFqbq4Bd3xT1Mq3vC@192.168.0.41/station_house");
-    pqxx::work txn{*pqc};
+  std::shared_ptr<pqxx::connection> pqc = nullptr;
 };
 
 static MyApp app;
