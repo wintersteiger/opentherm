@@ -70,31 +70,36 @@ public:
 
   Frame init_master_frames[2] = {Frame(ReadData, 0), Frame(ReadData, 3)};
 
-  Frame slave_data_frames[7] = {
-      Frame(ReadData, 3),   Frame(ReadData, 124), Frame(ReadData, 125),
-      Frame(ReadData, 126), Frame(ReadData, 127), Frame(ReadData, 57),
-      Frame(WriteData, 1, 80.0f)};
+  Frame slave_data_frames[6] = {Frame(ReadData, 3),  Frame(ReadData, 125),
+                                Frame(ReadData, 15), Frame(ReadData, 127),
+                                Frame(ReadData, 57), Frame(WriteData, 1, 0.0f)};
 
   Frame master_frames[11] = {
-      Frame(ReadData, 0),  Frame(ReadData, 10), Frame(ReadData, 15),
-      Frame(ReadData, 18), Frame(ReadData, 19), Frame(ReadData, 25),
-      Frame(ReadData, 26), Frame(ReadData, 28), Frame(ReadData, 33),
-      Frame(ReadData, 35), Frame(WriteData, 1)};
+      Frame(ReadData, 0),  Frame(ReadData, 10),      Frame(ReadData, 17),
+      Frame(ReadData, 18), Frame(ReadData, 19),      Frame(ReadData, 25),
+      Frame(ReadData, 26), Frame(ReadData, 28),      Frame(ReadData, 33),
+      Frame(ReadData, 35), Frame(WriteData, 1, 0.0f)};
 
   void advance() {
     switch (state) {
     case INIT:
-      state = SLAVE_DATA;
-      next_frame_index = 0;
+      master_index =
+          (master_index + 1) % (sizeof(init_master_frames) / sizeof(Frame));
+      if (master_index == 0) {
+        state = SLAVE_DATA;
+      }
       break;
     case SLAVE_DATA:
-      if (next_frame_index == 0) {
+      master_index =
+          (master_index + 1) % (sizeof(slave_data_frames) / sizeof(Frame));
+      if (master_index == 0) {
         llog("entering normal operation");
         state = NORMAL;
-        next_frame_index = 0;
       }
       break;
     case NORMAL:
+      master_index =
+          (master_index + 1) % (sizeof(master_frames) / sizeof(Frame));
       break;
     }
   }
@@ -104,30 +109,30 @@ public:
 
     switch (state) {
     case INIT:
-      f = init_master_frames[next_frame_index];
-      next_frame_index = (next_frame_index + 1) % 2;
+      f = init_master_frames[master_index];
       break;
     case SLAVE_DATA:
-      f = slave_data_frames[next_frame_index];
-      next_frame_index = (next_frame_index + 1) % 7;
+      f = slave_data_frames[master_index];
       break;
-    case NORMAL: {
-      f = master_frames[next_frame_index];
-      next_frame_index = (next_frame_index + 1) % 10;
-    }
+    case NORMAL:
+      f = master_frames[master_index];
     }
 
     if (f.id() == 0)
       tx(Frame(ReadData, f.id(), status, 0x00), true);
-    else if (f.id() == 1)
-      tx(Frame(ReadData, f.id(), current_setpoint), true);
+    else if (state == NORMAL && f.id() == 1)
+      tx(Frame(WriteData, f.id(), current_setpoint), true);
     else
       tx(f, true);
   }
 
+  void set_status(uint8_t x) { status = x; }
+  void set_setpoint(float x) { current_setpoint = x; }
+
 protected:
-  size_t next_frame_index = 0;
+  size_t master_index = 0;
   float current_setpoint = 0.0;
+  uint8_t status = 0;
 };
 
 class MyApp : public RichApplication {
@@ -174,6 +179,7 @@ public:
     Application::on_write_ack(data_id, data_value);
     slave_state[data_id].seen = true;
     slave_state[data_id].value = data_value;
+    device.advance();
   }
 
   virtual void on_data_invalid(uint8_t data_id, uint16_t data_value) override {
@@ -202,18 +208,31 @@ public:
 
     char payload[9];
     int len = snprintf(payload, sizeof(payload), "%08lx", (uint32_t)f);
-    mutex_enter_blocking(&mqtt_mtx);
-    if (mqtt_client && mqtt_client_is_connected(mqtt_client)) {
-      int err =
-          mqtt_publish(mqtt_client, mqtt_topic, payload, len, 0, 0, NULL, NULL);
-      if (err != ERR_OK) {
-        llog("App: mqtt_publish err=%d", err);
-        llog("App: lwIP stats: %lu %lu %lu %lu %lu", lwip_stats.mem.err,
-             lwip_stats.mem.avail, lwip_stats.mem.used, lwip_stats.mem.max,
-             lwip_stats.mem.illegal);
+
+    bool want_reconnect = false;
+
+    if (mqtt_client) {
+      mutex_enter_blocking(&mqtt_mtx);
+      {
+        if (!mqtt_client_is_connected(mqtt_client))
+          want_reconnect = true;
+        else {
+          int err = mqtt_publish(mqtt_client, mqtt_topic, payload, len, 0, 0,
+                                 NULL, NULL);
+          if (err != ERR_OK) {
+            llog("App: mqtt_publish err=%d", err);
+            llog("App: lwIP stats: %lu %lu %lu %lu %lu", lwip_stats.mem.err,
+                 lwip_stats.mem.avail, lwip_stats.mem.used, lwip_stats.mem.max,
+                 lwip_stats.mem.illegal);
+            want_reconnect = true;
+          }
+        }
       }
+      mutex_exit(&mqtt_mtx);
     }
-    mutex_exit(&mqtt_mtx);
+
+    if (want_reconnect)
+      mqtt_reconnect();
 
     return true;
   }
@@ -314,6 +333,19 @@ protected:
                 .rid = rid, .user_id = user_id};
             mqtt_num_active_requests++;
           }
+
+          Frame f(req_msg);
+          switch (f.id()) {
+          case 2: {
+            device.set_status(f.data_byte_1());
+            break;
+          }
+          case 1: {
+            float v = (req_msg & 0x0000FFFF) / 256.0f;
+            llog("new setpoint: %.2f", v);
+            device.set_setpoint(v);
+          }
+          }
         }
       }
 
@@ -350,20 +382,25 @@ protected:
     app->on_mqtt_connection(client, status);
   }
 
+  void mqtt_reconnect() {
+    llog("MQTT reconnecting");
+    mutex_enter_blocking(&mqtt_mtx);
+    {
+      if (mqtt_client) {
+        mqtt_disconnect(mqtt_client);
+        mqtt_client_free(mqtt_client);
+        mqtt_client = NULL;
+      }
+    }
+    mutex_exit(&mqtt_mtx);
+    mqtt_init();
+  }
+
   void on_mqtt_connection(mqtt_client_t *client,
                           mqtt_connection_status_t status) {
     llog("MQTT connection status: %d", status);
-    if (status == MQTT_CONNECT_DISCONNECTED || status == MQTT_CONNECT_TIMEOUT) {
-      llog("MQTT reconnecting");
-      mutex_enter_blocking(&mqtt_mtx);
-      {
-        if (mqtt_client)
-          mqtt_client_free(mqtt_client);
-        mqtt_client = NULL;
-      }
-      mutex_exit(&mqtt_mtx);
-      mqtt_init();
-    }
+    if (status == MQTT_CONNECT_DISCONNECTED || status == MQTT_CONNECT_TIMEOUT)
+      mqtt_reconnect();
   }
 
   void mqtt_init() {
@@ -517,6 +554,19 @@ size_t make_status_page(char *buf, size_t sz) {
           Application::ID::to_string(app.idmeta[i].type,
                                      app.slave_state[i].value),
           app.idmeta[i].description);
+  p += snprintf(p, sz - (p - buf),
+                "<tr><td colspan=3>lwIP memory stats</td><td>err=%u avail=%u "
+                "used=%u max=%u illegal=%u</td></tr>",
+                lwip_stats.mem.err, lwip_stats.mem.avail, lwip_stats.mem.used,
+                lwip_stats.mem.max, lwip_stats.mem.illegal);
+  for (size_t i = 0; i < MEMP_MAX; i++)
+    if (lwip_stats.memp[i])
+      p += snprintf(p, sz - (p - buf),
+                    "<tr><td colspan=3>lwIP memory pool '%s'</td><td>err=%u "
+                    "avail=%u used=%u max=%u illegal=%u</td></tr>",
+                    lwip_stats.memp[i]->name, lwip_stats.memp[i]->err,
+                    lwip_stats.memp[i]->avail, lwip_stats.memp[i]->used,
+                    lwip_stats.memp[i]->max, lwip_stats.memp[i]->illegal);
   p += snprintf(p, sz - (p - buf), "</table>");
   p += snprintf(p, sz - (p - buf), "</html>");
   return p - buf;

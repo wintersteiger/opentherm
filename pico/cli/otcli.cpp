@@ -1,5 +1,7 @@
 // CM Wintersteiger, 2022
 
+#include <stdio.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -43,14 +45,54 @@ public:
   }
 };
 
-class CLIApp : public Application {
+class CLIApp : public RichApplication {
 public:
-  CLIApp() : device(), Application(device) {
+  CLIApp() : device(), RichApplication(device) {
     device.set_frame_callback(Application::sprocess, this);
   }
   virtual ~CLIApp() = default;
 
   virtual void run() override {}
+
+  void inject(const Frame &f) {
+    process(f);
+  }
+
+  virtual void on_read_ack(uint8_t id, uint16_t value = 0x0000) override {
+    RichApplication::on_read_ack(id, value);
+    Application::ID *idp = find(id);
+    if (!idp)
+      printf("X unknown data ID");
+    else
+    {
+      Application::IDMeta &meta = CLIApp::idmeta[id];
+        printf("  %s == %s", meta.data_object, ID::to_string(meta.type, value));
+
+      if (id == 0) {
+        printf("\t\tfault: %d ch: %d dhw: %d flame: %d",
+          (value & 0x01) != 0,
+          (value & 0x02) != 0,
+          (value & 0x04) != 0,
+          (value & 0x08) != 0);
+      }
+
+      idp->value = value;
+    }
+    printf("\n");
+  }
+
+  virtual void on_write_ack(uint8_t id, uint16_t value = 0x0000) override {
+    RichApplication::on_write_ack(id, value);
+    Application::ID *idp = find(id);
+    if (!idp)
+      printf("X unknown data ID");
+    else
+    {
+      Application::IDMeta &meta = CLIApp::idmeta[id];
+      printf("  %s := %s\n", meta.data_object, ID::to_string(meta.type, value));
+      idp->value = value;
+    }
+  }
 
 protected:
   CLIDevice device;
@@ -143,17 +185,18 @@ void mosquitto_msg_callback(mosquitto *mosq, void *arg,
                             const mosquitto_message *msg) {
   const std::lock_guard<std::mutex> lock(log_mtx);
   if (msg->payloadlen != 12) {
-    std::cout << "unknown message of length " << msg->payloadlen << std::endl;
+    std::cout << "X unknown message of length " << msg->payloadlen << std::endl;
   } else {
     uint16_t rid = 0;
     uint32_t otmsg = 0;
     if (sscanf((char *)msg->payload, "%04hx%08x", &rid, &otmsg) != 2)
-      std::cout << "erroneous message: %s is not a hex-encoded request ID and "
+      std::cout << "X erroneous message: %s is not a hex-encoded request ID and "
                    "OpenTherm frame"
                 << std::endl;
     else {
       last_frame = Frame(otmsg);
       std::cout << "\r> " << to_string(last_frame) << std::endl;
+      app.inject(last_frame);
       request_id_rcvd = rid;
     }
   }
@@ -174,7 +217,7 @@ void mosquitto_init() {
   mosquitto_connect_callback_set(mosq, [](mosquitto *, void *, int rc) {
     if (rc != MOSQ_ERR_SUCCESS) {
       const std::lock_guard<std::mutex> lock(log_mtx);
-      std::cout << "MQTT connection failure: " << rc << std::endl;
+      std::cout << "X MQTT connection failure: " << rc << std::endl;
     }
   });
 
@@ -193,7 +236,7 @@ void mosquitto_init() {
       int r = mosquitto_loop(mosq, 125, 1);
       if (r != MOSQ_ERR_SUCCESS) {
         const std::lock_guard<std::mutex> lock(log_mtx);
-        std::cout << "MQTT reconnecting..." << std::endl;
+        std::cout << "! MQTT reconnecting..." << std::endl;
         mosquitto_reconnect(mosq);
       }
     }
@@ -207,6 +250,7 @@ void send_msg(const Frame &f) {
     const std::lock_guard<std::mutex> lock(log_mtx);
     std::cout << "\r< " << to_string(f) << std::endl;
   }
+  app.inject(f);
   char msg_hex[13];
   uint16_t request_id = next_request_id++;
   int len =
@@ -223,6 +267,7 @@ void send_msg(const Frame &f) {
   do {
     auto after = std::chrono::system_clock::now();
     if ((after - before) > command_timeout) {
+      const std::lock_guard<std::mutex> lock(log_mtx);
       std::cout << "\rX timeout" << std::endl;
       return;
     }
@@ -293,7 +338,7 @@ void register_cmds() {
     int id = 0;
     if (sscanf(args[0].c_str(), "%d", &id) != 1 | id > 255)
       throw std::runtime_error("invalid data id");
-    send_msg(Frame(MsgType::ReadData, id, 0));
+    send_msg(Frame(MsgType::ReadData, id, (uint16_t)0));
   };
 
   cmds["write"] = [](auto &args) {
@@ -311,7 +356,7 @@ void register_cmds() {
 
 void ask_for_input() {
   const std::lock_guard<std::mutex> lock(log_mtx);
-  std::cout << "* ";
+  std::cout << "\r* ";
   std::cout.flush();
 }
 
@@ -349,9 +394,11 @@ int main(int argc, const char **argv) {
       ask_for_input();
     }
   } catch (const std::exception &ex) {
+    const std::lock_guard<std::mutex> lock(log_mtx);
     std::cout << "\rX Exception: " << ex.what() << std::endl;
     r = 1;
   } catch (...) {
+    const std::lock_guard<std::mutex> lock(log_mtx);
     std::cout << "\rX Caught unknown exception" << std::endl;
     r = 2;
   }
