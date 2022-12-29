@@ -26,6 +26,8 @@
 using namespace std::chrono_literals;
 using namespace OpenTherm;
 
+static std::mutex log_mtx;
+
 static struct mosquitto *mosq = NULL;
 static std::thread *mosq_thread = nullptr;
 static bool mosq_thread_running = false;
@@ -54,26 +56,18 @@ public:
 
   virtual void run() override {}
 
-  void inject(const Frame &f) {
-    process(f);
-  }
-
   virtual void on_read_ack(uint8_t id, uint16_t value = 0x0000) override {
     RichApplication::on_read_ack(id, value);
     Application::ID *idp = find(id);
     if (!idp)
       printf("X unknown data ID");
-    else
-    {
+    else {
       Application::IDMeta &meta = CLIApp::idmeta[id];
-        printf("  %s == %s", meta.data_object, ID::to_string(meta.type, value));
+      printf("  %s == %s", meta.data_object, ID::to_string(meta.type, value));
 
       if (id == 0) {
-        printf("\t\tfault: %d ch: %d dhw: %d flame: %d",
-          (value & 0x01) != 0,
-          (value & 0x02) != 0,
-          (value & 0x04) != 0,
-          (value & 0x08) != 0);
+        printf("\t\tfault: %d ch: %d dhw: %d flame: %d", (value & 0x01) != 0,
+               (value & 0x02) != 0, (value & 0x04) != 0, (value & 0x08) != 0);
       }
 
       idp->value = value;
@@ -86,8 +80,7 @@ public:
     Application::ID *idp = find(id);
     if (!idp)
       printf("X unknown data ID");
-    else
-    {
+    else {
       Application::IDMeta &meta = CLIApp::idmeta[id];
       printf("  %s := %s\n", meta.data_object, ID::to_string(meta.type, value));
       idp->value = value;
@@ -100,7 +93,6 @@ protected:
 
 static CLIApp app;
 static auto command_timeout = 2s;
-static std::mutex log_mtx;
 static volatile uint16_t next_request_id = 0;
 static volatile uint16_t request_id_rcvd = -1;
 static Frame last_frame;
@@ -181,24 +173,32 @@ std::string to_string(const Frame &f) {
   return ss.str();
 }
 
-void mosquitto_msg_callback(mosquitto *mosq, void *arg,
-                            const mosquitto_message *msg) {
+void mosquitto_on_msg(mosquitto *mosq, void *arg,
+                      const mosquitto_message *msg) {
   const std::lock_guard<std::mutex> lock(log_mtx);
-  if (msg->payloadlen != 12) {
-    std::cout << "X unknown message of length " << msg->payloadlen << std::endl;
-  } else {
+  if (msg->payloadlen == 12) {
     uint16_t rid = 0;
     uint32_t otmsg = 0;
     if (sscanf((char *)msg->payload, "%04hx%08x", &rid, &otmsg) != 2)
-      std::cout << "X erroneous message: %s is not a hex-encoded request ID and "
-                   "OpenTherm frame"
-                << std::endl;
+      std::cout
+          << "X erroneous message: %s is not a hex-encoded request ID and "
+             "OpenTherm frame"
+          << std::endl;
     else {
       last_frame = Frame(otmsg);
       std::cout << "\r> " << to_string(last_frame) << std::endl;
-      app.inject(last_frame);
+      app.process(last_frame);
       request_id_rcvd = rid;
     }
+  } else
+    std::cout << "X unknown message of length " << msg->payloadlen << std::endl;
+}
+
+void mosquitto_on_log(struct mosquitto *mosq, void *obj, int level,
+                      const char *str) {
+  if (level < MOSQ_LOG_DEBUG) {
+    const std::lock_guard<std::mutex> lock(log_mtx);
+    std::cout << "- " << level << ": " << str << std::endl;
   }
 }
 
@@ -212,8 +212,8 @@ void mosquitto_init() {
   if (!mosq)
     throw std::bad_alloc();
 
-  // mosquitto_log_callback_set(mosq, ::on_log);
-  mosquitto_message_callback_set(mosq, mosquitto_msg_callback);
+  mosquitto_log_callback_set(mosq, mosquitto_on_log);
+  mosquitto_message_callback_set(mosq, mosquitto_on_msg);
   mosquitto_connect_callback_set(mosq, [](mosquitto *, void *, int rc) {
     if (rc != MOSQ_ERR_SUCCESS) {
       const std::lock_guard<std::mutex> lock(log_mtx);
@@ -221,7 +221,13 @@ void mosquitto_init() {
     }
   });
 
-  mosquitto_username_pw_set(mosq, "monitor", "UirHdEAPDxiOCB5939VQ");
+  const char* user = std::getenv("MQTT_USER");
+  const char* password = std::getenv("MQTT_PASS");
+
+  if (!user || !password)
+    throw std::runtime_error("missing MQTT auth settings");
+
+  mosquitto_username_pw_set(mosq, user, password);
 
   int r = mosquitto_connect(mosq, host.c_str(), port, keepalive);
   if (r != MOSQ_ERR_SUCCESS) {
@@ -250,7 +256,7 @@ void send_msg(const Frame &f) {
     const std::lock_guard<std::mutex> lock(log_mtx);
     std::cout << "\r< " << to_string(f) << std::endl;
   }
-  app.inject(f);
+  app.process(f);
   char msg_hex[13];
   uint16_t request_id = next_request_id++;
   int len =
@@ -331,7 +337,7 @@ static void handle_line(std::string &line, volatile bool &keep_running) {
   }
 }
 
-void register_cmds() {
+static void register_cmds() {
   cmds["read"] = [](auto &args) {
     if (args.size() != 1)
       throw std::runtime_error("invalid number of arguments");
@@ -354,7 +360,7 @@ void register_cmds() {
   };
 }
 
-void ask_for_input() {
+static void ask_for_input() {
   const std::lock_guard<std::mutex> lock(log_mtx);
   std::cout << "\r* ";
   std::cout.flush();
@@ -391,6 +397,7 @@ int main(int argc, const char **argv) {
       std::string line;
       std::getline(std::cin, line);
       handle_line(line, keep_running);
+      // std::this_thread::sleep_for(500ms);
       ask_for_input();
     }
   } catch (const std::exception &ex) {

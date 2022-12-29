@@ -6,6 +6,7 @@
 #include <hardware/clocks.h>
 #include <hardware/exception.h>
 #include <hardware/pll.h>
+#include <hardware/flash.h>
 #include <pico/cyw43_arch.h>
 #include <pico/multicore.h>
 #include <pico/mutex.h>
@@ -85,17 +86,14 @@ public:
     case INIT:
       master_index =
           (master_index + 1) % (sizeof(init_master_frames) / sizeof(Frame));
-      if (master_index == 0) {
+      if (master_index == 0)
         state = SLAVE_DATA;
-      }
       break;
     case SLAVE_DATA:
       master_index =
           (master_index + 1) % (sizeof(slave_data_frames) / sizeof(Frame));
-      if (master_index == 0) {
-        llog("entering normal operation");
+      if (master_index == 0)
         state = NORMAL;
-      }
       break;
     case NORMAL:
       master_index =
@@ -118,12 +116,17 @@ public:
       f = master_frames[master_index];
     }
 
-    if (f.id() == 0)
-      tx(Frame(ReadData, f.id(), status, 0x00), true);
-    else if (state == NORMAL && f.id() == 1)
-      tx(Frame(WriteData, f.id(), current_setpoint), true);
-    else
-      tx(f, true);
+    switch (f.id()) {
+    case 0:
+      f = Frame(ReadData, f.id(), status, 0x00);
+      break;
+    case 1:
+      if (state == NORMAL)
+        f = Frame(f.msg_type(), f.id(), current_setpoint);
+      break;
+    }
+
+    tx(f, true);
   }
 
   void set_status(uint8_t x) { status = x; }
@@ -141,9 +144,9 @@ public:
 
   MyApp(const Pins &pins)
       : RichApplication(device), device(pins),
+        mqtt_publish_queue(mqtt_max_concurrent_requests),
         wifi_link_timer(0, 1000000, on_wifi_link_timer_cb, nullptr, this) {
     device.set_frame_callback(Application::sprocess, this);
-    mutex_init(&mqtt_mtx);
 
     sconfig_smemberid = (uint16_t)0x0000;
     ot_version_master = 2.2f;
@@ -168,15 +171,24 @@ public:
 
   virtual void on_read_ack(uint8_t data_id, uint16_t data_value) override {
     ::llog("Read-Ack(%d, %04x)", data_id, data_value);
-    Application::on_read_ack(data_id, data_value);
+    RichApplication::on_read_ack(data_id, data_value);
     slave_state[data_id].seen = true;
     slave_state[data_id].value = data_value;
     device.advance();
+
+    switch (data_id) {
+    case 0:
+      if ((data_value & 0x0001) != 0) {
+        // Slave indicates a fault; try to get a fault code.
+        tx(Frame(ReadData, 5));
+      }
+      break;
+    }
   }
 
   virtual void on_write_ack(uint8_t data_id, uint16_t data_value) override {
     ::llog("Write-Ack(%d, %04x)", data_id, data_value);
-    Application::on_write_ack(data_id, data_value);
+    RichApplication::on_write_ack(data_id, data_value);
     slave_state[data_id].seen = true;
     slave_state[data_id].value = data_value;
     device.advance();
@@ -184,13 +196,13 @@ public:
 
   virtual void on_data_invalid(uint8_t data_id, uint16_t data_value) override {
     ::llog("Data-Invalid(%d, %04x)", data_id, data_value);
-    Application::on_data_invalid(data_id, data_value);
+    RichApplication::on_data_invalid(data_id, data_value);
   }
 
   virtual void on_unknown_data_id(uint8_t data_id,
                                   uint16_t data_value) override {
     ::llog("Unknown-DataID(%d, %04x)", data_id, data_value);
-    Application::on_unknown_data_id(data_id, data_value);
+    RichApplication::on_unknown_data_id(data_id, data_value);
   }
 
   virtual RequestID tx(const Frame &f, bool skip_if_busy = false,
@@ -203,37 +215,11 @@ public:
   MyDevice &dev() { return device; }
 
   virtual bool process(const Frame &f) override {
-    if (!Application::process(f))
+    if (!RichApplication::process(f))
       return false;
 
-    char payload[9];
-    int len = snprintf(payload, sizeof(payload), "%08lx", (uint32_t)f);
-
-    bool want_reconnect = false;
-
-    if (mqtt_client) {
-      mutex_enter_blocking(&mqtt_mtx);
-      {
-        if (!mqtt_client_is_connected(mqtt_client))
-          want_reconnect = true;
-        else {
-          int err = mqtt_publish(mqtt_client, mqtt_topic, payload, len, 0, 0,
-                                 NULL, NULL);
-          if (err != ERR_OK) {
-            llog("App: mqtt_publish err=%d", err);
-            llog("App: lwIP stats: %lu %lu %lu %lu %lu", lwip_stats.mem.err,
-                 lwip_stats.mem.avail, lwip_stats.mem.used, lwip_stats.mem.max,
-                 lwip_stats.mem.illegal);
-            want_reconnect = true;
-          }
-        }
-      }
-      mutex_exit(&mqtt_mtx);
-    }
-
-    if (want_reconnect)
-      mqtt_reconnect();
-
+    mqtt_publish_queue_add(mqtt_topic, f);
+    mqtt_publish_all_queued();
     return true;
   }
 
@@ -252,16 +238,21 @@ public:
 
   SlaveState slave_state[256] = {{0}};
 
+  size_t num_mqtt_reinit = 0;
+
+  size_t tx_frame_count() const { return device.tx_frame_count; }
+  size_t rx_frame_count() const { return device.rx_frame_count; }
+
 protected:
   MyDevice device;
 
-  mqtt_client_t *mqtt_client;
+  mqtt_client_t *mqtt_client = nullptr;
   struct mqtt_connect_client_info_t mqtt_client_info;
   static constexpr const char *mqtt_topic = "OpenThermOstat";
   static constexpr const char *mqtt_cmd_in_topic = "OpenThermOstat/command/in";
   static constexpr const char *mqtt_cmd_out_topic =
       "OpenThermOstat/command/out";
-  mutex_t mqtt_mtx;
+  PicoSemaphore mqtt_sem;
 
   struct MQTTRequest {
     RequestID rid = NoRequestID;
@@ -269,10 +260,73 @@ protected:
   };
 
   static constexpr const size_t mqtt_max_concurrent_requests = 16;
-  MQTTRequest mqtt_requests[mqtt_max_concurrent_requests];
-  size_t mqtt_num_active_requests = 0;
+
+  MQTTRequest mqtt_cmd_requests[mqtt_max_concurrent_requests];
+  size_t mqtt_num_active_cmd_requests = 0;
   char mosq_cmd_hex[13 * mqtt_max_concurrent_requests];
-  size_t mosq_data_arrived;
+  size_t mosq_data_arrived = 0;
+
+  struct MQTTPublishRequest {
+    const char *topic;
+    char payload[32];
+    size_t length;
+  };
+
+  PicoQueue<MQTTPublishRequest> mqtt_publish_queue;
+
+  void mqtt_publish_queue_add(const MQTTPublishRequest &req) {
+    if (!mqtt_publish_queue.try_add(req))
+      llog("dropping MQTT publish request");
+  }
+
+  void mqtt_publish_queue_add(const char *topic, const Frame &f) {
+    MQTTPublishRequest req;
+    req.topic = topic;
+    req.length =
+        snprintf(req.payload, sizeof(req.payload), "%08lx", (uint32_t)f);
+    mqtt_publish_queue_add(req);
+  }
+
+  void mqtt_publish_all_queued() {
+    if (!mqtt_client)
+      return;
+
+    MQTTPublishRequest req;
+    while (mqtt_publish_queue.try_remove(req)) {
+      if (!mqtt_client)
+        mqtt_reinit();
+
+      bool retry = true;
+      while (retry) {
+        retry = false;
+
+        while (!mqtt_sem.acquire_timeout(25000)) {
+          llog("mqtt_sem timeout; forcing release of semaphore");
+          mqtt_sem.release();
+        }
+
+        int err = mqtt_publish(
+            mqtt_client, req.topic, req.payload, req.length, 0, 0,
+            [](void *arg, err_t err) {
+              if (err != ERR_OK)
+                llog("mqtt_publish failed (callback): err=%d", err);
+              // retry?
+              static_cast<PicoSemaphore*>(arg)->release();
+            },
+            &mqtt_sem);
+        if (err != ERR_OK) {
+          llog("mqtt_publish failed (call): err=%d", err);
+          llog("lwIP stats: %lu %lu %lu %lu %lu", lwip_stats.mem.err,
+                lwip_stats.mem.avail, lwip_stats.mem.used, lwip_stats.mem.max,
+                lwip_stats.mem.illegal);
+          mqtt_reinit();
+          retry = true;
+          llog("retrying");
+          mqtt_sem.release();
+        }
+      }
+    }
+  }
 
   static void on_mqtt_publish_cb(void *arg, const char *topic, u32_t tot_len) {
     MyApp *app = static_cast<MyApp *>(arg);
@@ -306,32 +360,32 @@ protected:
         llog("error: invalid MQTT input; not a hex-encoded request ID and "
              "OpenTherm frame");
       else {
-        if (mqtt_num_active_requests >= mqtt_max_concurrent_requests)
+        if (mqtt_num_active_cmd_requests >= mqtt_max_concurrent_requests)
           llog("error: too many MQTT requests");
         else {
-          RequestID rid =
-              tx(req_msg, false,
-                 [](Application *a, RequestStatus s, RequestID rid,
-                    const Frame &f) {
-                   MyApp *app = static_cast<MyApp *>(a);
-                   auto &req =
-                       app->mqtt_requests[rid % mqtt_max_concurrent_requests];
-                   if (req.rid != rid)
-                     llog("warning: outdated MQTT request ID");
-                   else {
-                     req.rid = NoRequestID;
-                     app->mqtt_publish_cmd_response(s, req.user_id, f);
-                     app->mqtt_num_active_requests--;
-                   }
-                 });
+          RequestID rid = tx(
+              req_msg, false,
+              [](Application *a, RequestStatus s, RequestID rid,
+                 const Frame &f) {
+                MyApp *app = static_cast<MyApp *>(a);
+                auto &req =
+                    app->mqtt_cmd_requests[rid % mqtt_max_concurrent_requests];
+                if (req.rid != rid)
+                  llog("warning: outdated MQTT request ID");
+                else {
+                  req.rid = NoRequestID;
+                  app->mqtt_publish_cmd_response(s, req.user_id, f);
+                  app->mqtt_num_active_cmd_requests--;
+                }
+              });
 
           if (rid == NoRequestID)
             llog("error: failure to submit MQTT request (the queue is likely "
                  "full)");
           else {
-            mqtt_requests[rid % mqtt_max_concurrent_requests] = {
+            mqtt_cmd_requests[rid % mqtt_max_concurrent_requests] = {
                 .rid = rid, .user_id = user_id};
-            mqtt_num_active_requests++;
+            mqtt_num_active_cmd_requests++;
           }
 
           Frame f(req_msg);
@@ -357,23 +411,11 @@ protected:
 
   void mqtt_publish_cmd_response(RequestStatus s, uint16_t user_id,
                                  const Frame &f) {
-    char rsp[13] = "";
-    snprintf(rsp, sizeof(rsp), "%04x%08lx", user_id, (uint32_t)f);
-
-    mutex_enter_blocking(&mqtt_mtx);
-    {
-      if (mqtt_client && mqtt_client_is_connected(mqtt_client))
-        mqtt_publish(
-            mqtt_client, mqtt_cmd_out_topic, rsp, 12, 0, 0,
-            [](void *arg, err_t err) {
-              if (err != ERR_OK)
-                llog("mqtt_publish failed: %d", err);
-            },
-            NULL);
-      else
-        llog("error: MQTT client not connected");
-    }
-    mutex_exit(&mqtt_mtx);
+    MQTTPublishRequest req;
+    req.topic = mqtt_cmd_out_topic;
+    req.length = snprintf(req.payload, sizeof(req.payload), "%04x%08lx",
+                          user_id, (uint32_t)f);
+    mqtt_publish_queue_add(req);
   }
 
   static void on_mqtt_connection_cb(mqtt_client_t *client, void *arg,
@@ -382,80 +424,70 @@ protected:
     app->on_mqtt_connection(client, status);
   }
 
-  void mqtt_reconnect() {
-    llog("MQTT reconnecting");
-    mutex_enter_blocking(&mqtt_mtx);
-    {
-      if (mqtt_client) {
-        mqtt_disconnect(mqtt_client);
-        mqtt_client_free(mqtt_client);
-        mqtt_client = NULL;
-      }
-    }
-    mutex_exit(&mqtt_mtx);
-    mqtt_init();
-  }
-
   void on_mqtt_connection(mqtt_client_t *client,
                           mqtt_connection_status_t status) {
     llog("MQTT connection status: %d", status);
-    if (status == MQTT_CONNECT_DISCONNECTED || status == MQTT_CONNECT_TIMEOUT)
-      mqtt_reconnect();
+    // if (status == MQTT_CONNECT_DISCONNECTED || status ==
+    // MQTT_CONNECT_TIMEOUT)
+    //   mqtt_reinit();
+  }
+
+  void mqtt_reinit() {
+    llog("MQTT reconnecting");
+    num_mqtt_reinit++;
+    if (mqtt_client) {
+      mqtt_disconnect(mqtt_client);
+      mqtt_client_free(mqtt_client);
+      mqtt_client = NULL;
+    }
+    mqtt_init();
   }
 
   void mqtt_init() {
     mosq_data_arrived = 0;
 
+    static const char *mqtt_host = "192.168.0.41";
     mqtt_client_info.client_id = "OpenThermOstat";
     mqtt_client_info.client_user = "monitor";
     mqtt_client_info.client_pass = "UirHdEAPDxiOCB5939VQ";
 
     ip_addr_t ip;
-    if (ipaddr_aton("192.168.0.41", &ip) != 1) {
+    if (ipaddr_aton(mqtt_host, &ip) != 1) {
       llog("ipaddr_aton failed");
       return;
     }
 
-    mutex_enter_blocking(&mqtt_mtx);
+    u16_t port = 1883;
 
-    {
-      u16_t port = 1883;
+    mqtt_client = mqtt_client_new();
 
-      mqtt_client = mqtt_client_new();
-
-      if (!mqtt_client) {
-        llog("failed to allocate new MQTT client");
-        mutex_exit(&mqtt_mtx);
-        return;
-      }
-
-      err_t r =
-          mqtt_client_connect(mqtt_client, &ip, port, on_mqtt_connection_cb,
-                              this, &mqtt_client_info);
-      if (r != ERR_OK) {
-        llog("mqtt_client_connect failed: %d", r);
-        mutex_exit(&mqtt_mtx);
-        return;
-      }
-
-      r = mqtt_subscribe(
-          mqtt_client, mqtt_cmd_in_topic, 0,
-          [](void *arg, err_t err) {
-            if (err != ERR_OK)
-              llog("mqtt_subscribe timed out: %d", err);
-          },
-          NULL);
-      if (r != ERR_OK) {
-        llog("mqtt_subscribe failed: %d", r);
-        mutex_exit(&mqtt_mtx);
-        return;
-      }
-
-      mqtt_set_inpub_callback(mqtt_client, on_mqtt_publish_cb, on_mqtt_data_cb,
-                              this);
+    if (!mqtt_client) {
+      llog("failed to allocate new MQTT client");
+      return;
     }
 
-    mutex_exit(&mqtt_mtx);
+    err_t r =
+        mqtt_client_connect(mqtt_client, &ip, port, on_mqtt_connection_cb,
+                            this, &mqtt_client_info);
+    if (r != ERR_OK) {
+      llog("mqtt_client_connect failed: %d", r);
+      return;
+    }
+
+    r = mqtt_subscribe(
+        mqtt_client, mqtt_cmd_in_topic, 0,
+        [](void *arg, err_t err) {
+          if (err != ERR_OK)
+            llog("mqtt_subscribe timed out: %d", err);
+        },
+        NULL);
+    if (r != ERR_OK) {
+      llog("mqtt_subscribe failed: %d", r);
+      return;
+    }
+
+    mqtt_set_inpub_callback(mqtt_client, on_mqtt_publish_cb, on_mqtt_data_cb,
+                            this);
   }
 
   bool wifi_link_down = true;
@@ -501,7 +533,7 @@ protected:
 MyApp app({.rx = 27, .tx = 26, .owned = true});
 
 extern "C" {
-#define MAX_RESPONSE_SIZE 3 * 1024
+#define MAX_RESPONSE_SIZE 5 * 1024
 
 struct FSCustomData {
   uint64_t request_id = -1;
@@ -539,37 +571,66 @@ static int make_http_response(char *state, FSCustomData *data) {
 }
 
 size_t make_status_page(char *buf, size_t sz) {
+#define PSZ p, sz - (p - buf)
+
   char *p = buf;
-  p += snprintf(p, sz - (p - buf), "<html>");
-  p += snprintf(p, sz - (p - buf), "<table border=1>");
-  p += snprintf(p, sz - (p - buf),
+  p += snprintf(PSZ, "<html>");
+  p += snprintf(
+      PSZ,
+      "<head><style>td{text-align:right}#txt{text-align:left}</style></head>");
+
+  p += snprintf(PSZ, "<h2>Controller statistics</h2>");
+  p += snprintf(PSZ, "<table border=1>");
+  p += snprintf(PSZ, "<tr><th>Item</th><th>Value</th></tr>");
+  p += snprintf(PSZ, "<tr><td id=\"txt\">Uptime</td><td>%.2f sec</td></tr>",
+                time_us_64() / 1e6);
+  p += snprintf(
+      PSZ, "<tr><td id=\"txt\">Core temperature</td><td>%.2f &deg;C</td></tr>",
+      get_core_temperature());
+  p += snprintf(PSZ, "<tr><td id=\"txt\">MQTT reconnects</td><td>%u</td></tr>",
+                app.num_mqtt_reinit);
+  p +=
+      snprintf(PSZ, "<tr><td id=\"txt\"># frames rx/tx</td><td>%u/%u</td></tr>",
+               app.tx_frame_count(), app.rx_frame_count());
+  p += snprintf(PSZ, "</table>");
+
+  p += snprintf(PSZ, "<h2>OpenTherm data IDs</h2>");
+  p += snprintf(PSZ, "<table border=1>");
+  p += snprintf(PSZ,
                 "<tr><th>Data "
                 "ID</th><th>Raw</th><th>Value</th><th>Description</th></tr>");
   for (size_t i = 0; i < 256; i++)
     if (app.slave_state[i].seen)
       p += snprintf(
-          p, sz - (p - buf),
-          "<tr><td>%u</td><td>%04x</td><td align=right>%s</td><td>%s</td</tr>",
+          PSZ,
+          "<tr><td>%u</td><td>%04x</td><td>%s</td><td id=\"txt\">%s</td</tr>",
           i, app.slave_state[i].value,
           Application::ID::to_string(app.idmeta[i].type,
                                      app.slave_state[i].value),
           app.idmeta[i].description);
-  p += snprintf(p, sz - (p - buf),
-                "<tr><td colspan=3>lwIP memory stats</td><td>err=%u avail=%u "
-                "used=%u max=%u illegal=%u</td></tr>",
+  p += snprintf(PSZ, "</table>");
+
+  p += snprintf(PSZ, "<h2>lwIP memory statistics</h2>");
+  p += snprintf(PSZ, "<table border=1>");
+  p += snprintf(PSZ, "<tr><th>Pool</th><th>err</th><th>avail</th>"
+                     "<th>used</th><th>max</th><th>illegal</th></tr>");
+  p += snprintf(PSZ,
+                "<tr><td id=\"txt\">Global</td><td>%u</td><td>%lu</td><td>%lu</"
+                "td><td>%lu</td><td>%u</td></tr>",
                 lwip_stats.mem.err, lwip_stats.mem.avail, lwip_stats.mem.used,
                 lwip_stats.mem.max, lwip_stats.mem.illegal);
   for (size_t i = 0; i < MEMP_MAX; i++)
     if (lwip_stats.memp[i])
-      p += snprintf(p, sz - (p - buf),
-                    "<tr><td colspan=3>lwIP memory pool '%s'</td><td>err=%u "
-                    "avail=%u used=%u max=%u illegal=%u</td></tr>",
+      p += snprintf(PSZ,
+                    "<tr><td id=\"txt\">%s</td><td>%u</td><td>%lu</td><td>%lu</"
+                    "td><td>%lu</td><td>%u</td></tr>",
                     lwip_stats.memp[i]->name, lwip_stats.memp[i]->err,
                     lwip_stats.memp[i]->avail, lwip_stats.memp[i]->used,
                     lwip_stats.memp[i]->max, lwip_stats.memp[i]->illegal);
-  p += snprintf(p, sz - (p - buf), "</table>");
-  p += snprintf(p, sz - (p - buf), "</html>");
+  p += snprintf(PSZ, "</table>");
+  p += snprintf(PSZ, "</html>");
   return p - buf;
+#undef PSZ
 }
 
 int fs_open_custom(struct fs_file *file, const char *name) {
@@ -584,7 +645,7 @@ int fs_open_custom(struct fs_file *file, const char *name) {
 
     auto data = (FSCustomData *)mem_malloc(sizeof(FSCustomData));
     if (!data)
-      llog("App: file state allocation failure");
+      llog("file state allocation failure");
     else {
       data->request_id = NoRequestID;
       data->status = NULL;

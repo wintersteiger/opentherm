@@ -1,18 +1,18 @@
 #include <stdio.h>
 
 #include <iostream>
-#include <unordered_set>
 #include <memory>
-#include <thread>
 #include <mutex>
+#include <thread>
+#include <unordered_set>
 
 #include <mosquitto.h>
 
-#include <pqxx/pqxx>
 #include <pqxx/except.hxx>
+#include <pqxx/pqxx>
 
-#include <opentherm/transport.h>
 #include <opentherm/application.h>
+#include <opentherm/transport.h>
 
 using namespace OpenTherm;
 using namespace std::chrono_literals;
@@ -25,20 +25,22 @@ public:
   virtual RequestID tx(const Frame &f, bool skip_if_busy = false,
                        void (*callback)(Application *, RequestStatus, RequestID,
                                         const Frame &) = nullptr,
-                       Application *app = nullptr) override
-  {
+                       Application *app = nullptr) override {
     return NoRequestID;
   }
 };
-
 
 class MyApp : public Application {
 public:
   MyApp() : Application(device) {
     device.set_frame_callback(Application::sprocess, this);
 
-    pqc = std::make_shared<pqxx::connection>("postgresql://cwinter:UxTCFqbq4Bd3xT1Mq3vC@192.168.0.41/station_house");
-    // pqxx::work txn{*pqc};
+    const char* cs = std::getenv("PQCONNECTION");
+
+    if (!cs)
+      throw std::runtime_error("no connection string");
+
+    pqc = std::make_shared<pqxx::connection>(cs);
   }
 
   virtual ~MyApp() = default;
@@ -46,7 +48,7 @@ public:
   virtual void run() override {}
 
   void update(uint8_t id, uint16_t value) {
-    ID* idp = find(id);
+    ID *idp = find(id);
     if (!idp) {
       idp = new ID();
       // index[id] = idp;
@@ -55,16 +57,21 @@ public:
     idp->value = value;
   }
 
-  void dev_process(const Frame &f) {
-    device.process(f);
+  bool process(const Frame &f) override {
+    if (!Application::process(f))
+      return false;
 
     if (pqc) {
       pqxx::nontransaction ntx(*pqc);
       static char msg_type_hex[3], value_hex[5];
       snprintf(msg_type_hex, sizeof(msg_type_hex), "%02x", f.msg_type());
       snprintf(value_hex, sizeof(value_hex), "%04x", f.value());
-      ntx.exec0(std::string("INSERT INTO boiler VALUES(NOW(), '\\x") + msg_type_hex + "', " + std::to_string(f.id()) + ", '\\x" + value_hex + "');");
+      ntx.exec0(std::string("INSERT INTO boiler VALUES(NOW(), '\\x") +
+                msg_type_hex + "', " + std::to_string(f.id()) + ", '\\x" +
+                value_hex + "');");
     }
+
+    return true;
   }
 
   bool outp = false;
@@ -78,11 +85,9 @@ public:
         Application::IDMeta &meta = MyApp::idmeta[id];
         printf("%s == %s", meta.data_object, ID::to_string(meta.type, value));
         printf("\t\tch: %d dhw: %d cool: %d otc: %d ch2: %d",
-          (value & 0x0100) != 0,
-          (value & 0x0200) != 0,
-          (value & 0x0400) != 0,
-          (value & 0x0800) != 0,
-          (value & 0x1000) != 0);
+               (value & 0x0100) != 0, (value & 0x0200) != 0,
+               (value & 0x0400) != 0, (value & 0x0800) != 0,
+               (value & 0x1000) != 0);
       }
       master_state = value;
     }
@@ -90,23 +95,19 @@ public:
 
   virtual void on_read_ack(uint8_t id, uint16_t value = 0x0000) override {
     Application::on_read_ack(id, value);
-    if (outp)
-    {
+    if (outp) {
       Application::ID *idp = find(id);
       if (!idp)
         printf("unknown data ID");
-      else
-      {
+      else {
         Application::IDMeta &meta = MyApp::idmeta[id];
         if ((id != 0 && id != 3) || idp->value != value) {
-            printf("%s == %s", meta.data_object, ID::to_string(meta.type, value));
+          printf("%s == %s", meta.data_object, ID::to_string(meta.type, value));
 
           if (id == 0 && (idp->value & 0x00FF) != (value & 0x00FF)) {
             printf("\t\tfault: %d ch: %d dhw: %d flame: %d",
-              (value & 0x01) != 0,
-              (value & 0x02) != 0,
-              (value & 0x04) != 0,
-              (value & 0x08) != 0);
+                   (value & 0x01) != 0, (value & 0x02) != 0,
+                   (value & 0x04) != 0, (value & 0x08) != 0);
           }
         }
 
@@ -117,13 +118,11 @@ public:
 
   virtual void on_write_ack(uint8_t id, uint16_t value = 0x0000) override {
     Application::on_write_ack(id, value);
-    if (outp)
-    {
+    if (outp) {
       Application::ID *idp = find(id);
       if (!idp)
         printf("unknown data ID");
-      else
-      {
+      else {
         Application::IDMeta &meta = MyApp::idmeta[id];
         printf("%s := %s", meta.data_object, ID::to_string(meta.type, value));
         idp->value = value;
@@ -144,20 +143,39 @@ static std::thread *mosq_thread = nullptr;
 static bool mosq_thread_running = false;
 static const char *mosq_topic = "OpenThermOstat/#";
 
-void mosquitto_msg_callback(mosquitto *mosq, void *arg,
-                            const mosquitto_message *msg) {
+void mosquitto_on_msg(mosquitto *mosq, void *arg,
+                      const mosquitto_message *msg) {
   const std::lock_guard<std::mutex> lock(log_mtx);
-  if (msg->payloadlen != 8) {
-    std::cout << "unknown message of length " << msg->payloadlen << std::endl;
-  } else {
+  if (msg->payloadlen == 8) {
     uint32_t otmsg = 0;
     if (sscanf((char *)msg->payload, "%08x", &otmsg) != 1)
       std::cout << "erroneous message: not an OpenTherm frame" << std::endl;
     else {
       Frame f(otmsg);
       std::cout << "\r> " << f.to_string() << std::endl;
-      app.dev_process(f);
+      app.process(f);
     }
+  } else if (msg->payloadlen == 12) {
+    uint32_t otmsg = 0;
+    uint16_t rid = 0;
+    if (sscanf((char *)msg->payload, "%04hx%08x", &rid, &otmsg) != 2)
+      std::cout << "erroneous message: not an RID + OpenTherm frame"
+                << std::endl;
+    else {
+      Frame f(otmsg);
+      std::cout << "\r> " << rid << ": " << f.to_string() << std::endl;
+      // We don't log commands/replies.
+      // app.process(f);
+    }
+  } else
+    std::cout << "unknown message of length " << msg->payloadlen << std::endl;
+}
+
+void mosquitto_on_log(struct mosquitto *mosq, void *obj, int level,
+                      const char *str) {
+  if (level < MOSQ_LOG_DEBUG) {
+    const std::lock_guard<std::mutex> lock(log_mtx);
+    std::cout << "- " << level << ": " << str << std::endl;
   }
 }
 
@@ -171,8 +189,8 @@ void mosquitto_init() {
   if (!mosq)
     throw std::bad_alloc();
 
-  // mosquitto_log_callback_set(mosq, ::on_log);
-  mosquitto_message_callback_set(mosq, mosquitto_msg_callback);
+  mosquitto_log_callback_set(mosq, ::mosquitto_on_log);
+  mosquitto_message_callback_set(mosq, ::mosquitto_on_msg);
   mosquitto_connect_callback_set(mosq, [](mosquitto *, void *, int rc) {
     if (rc != MOSQ_ERR_SUCCESS) {
       const std::lock_guard<std::mutex> lock(log_mtx);
@@ -180,7 +198,13 @@ void mosquitto_init() {
     }
   });
 
-  mosquitto_username_pw_set(mosq, "monitor", "UirHdEAPDxiOCB5939VQ");
+  const char* user = std::getenv("MQTT_USER");
+  const char* password = std::getenv("MQTT_PASS");
+
+  if (!user || !password)
+    throw std::runtime_error("missing MQTT auth settings");
+
+  mosquitto_username_pw_set(mosq, user, password);
 
   int r = mosquitto_connect(mosq, host.c_str(), port, keepalive);
   if (r != MOSQ_ERR_SUCCESS) {
@@ -196,6 +220,7 @@ void mosquitto_init() {
       if (r != MOSQ_ERR_SUCCESS) {
         const std::lock_guard<std::mutex> lock(log_mtx);
         std::cout << "MQTT reconnecting..." << std::endl;
+        std::this_thread::sleep_for(250ms);
         mosquitto_reconnect(mosq);
       }
     }
@@ -204,8 +229,7 @@ void mosquitto_init() {
   r = mosquitto_subscribe(mosq, NULL, mosq_topic, 0);
 }
 
-int main(int argc, const char **argv)
-{
+int main(int argc, const char **argv) {
   if (argc != 1) {
     std::cout << "Usage: " << argv[0] << std::endl;
     return 1;

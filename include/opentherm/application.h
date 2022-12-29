@@ -124,6 +124,8 @@ protected:
 
   IDMeta *idmeta = nullptr;
 
+public:
+
 #define DID(NR, MSG, FNAME, OBJECT, TYPE, DESC)                                \
   ID FNAME = ID(NR, MSG, OBJECT, TYPE, DESC, index, index_size, idmeta);
 
@@ -132,7 +134,7 @@ protected:
   // association) for test & diagnostic purposes only.
 
   // clang-format off
-  DID(  0, RO, status, "Status", flag8_flag8, "Master and Slave Status flags.");
+  DID(  0, RO, status, "Status", flag8_flag8, "Master and Slave Status flags");
   DID(  1, WO, tset, "TSet", F88, "Control setpoint, i.e. CH water temperature setpoint (&deg;C)");
   DID(  2, WO, mconfig_mmemberid, "M-Config / M-MemberIDcode", flag8_u8, "Master Configuration Flags / Master MemberID Code");
   DID(  3, RO, sconfig_smemberid, "S-Config / S-MemberIDcode", flag8_u8, "Slave Configuration Flags / Slave MemberID Code");
@@ -143,15 +145,15 @@ protected:
   DID(  8, WO, tsetch2, "TsetCH2", F88, "Control setpoint for 2nd CH circuit (&deg;C)");
   DID(  9, RO, troverride, "TrOverride", F88, "Remote override room setpoint");
   DID( 10, RO, tsp, "TSP", u8_u8, "Number of Transparent-Slave-Parameters supported by slave");
-  DID( 11, RW, tsp_index_value, "TSP-index / TSP-value", u8_u8, "Index number / Value of referred-to transparent slave parameter.");
+  DID( 11, RW, tsp_index_value, "TSP-index / TSP-value", u8_u8, "Index number / Value of referred-to transparent slave parameter");
   DID( 12, RO, fhb_size, "FHB-size", u8_u8, "Size of Fault-History-Buffer supported by slave");
-  DID( 13, RO, fhb_index_value, "FHB-index / FHB-value", u8_u8, "Index number / Value of referred-to fault-history buffer entry.");
+  DID( 13, RO, fhb_index_value, "FHB-index / FHB-value", u8_u8, "Index number / Value of referred-to fault-history buffer entry");
   DID( 14, WO, max_rel_mod_level_setting, "Max-rel-mod-level-setting", F88, "Maximum relative modulation level setting (%)");
   DID( 15, RO, max_capacity_min_mod_level, "Max-Capacity / Min-Mod-Level", u8_u8, "Maximum boiler capacity (kW) / Minimum boiler modulation level (%)");
   DID( 16, WO, trset, "TrSet", F88, "Room Setpoint (&deg;C)");
   DID( 17, RO, rel_mod_level, "Rel.-mod-level", F88, "Relative Modulation Level (%)");
   DID( 18, RO, ch_pressure, "CH-pressure", F88, "Water pressure in CH circuit (bar)");
-  DID( 19, RO, dhw_flow_rate, "DHW-flow-rate", F88, "Water flow rate in DHW circuit. (litres/minute)");
+  DID( 19, RO, dhw_flow_rate, "DHW-flow-rate", F88, "Water flow rate in DHW circuit (litres/minute)");
   DID( 20, RW, day_time, "Day-Time", special_u8, "Day of Week and Time of Day");
   DID( 21, RW, date, "Date", u8_u8, "Calendar date");
   DID( 22, RW, year, "Year", u16, "Calendar year");
@@ -172,7 +174,7 @@ protected:
   DID( 56, RW, tdhwset, "TdhwSet", F88, "DHW setpoint (&deg;C) (Remote parameter 1)");
   DID( 57, RW, maxtset, "MaxTSet", F88, "Max CH water setpoint (&deg;C) (Remote parameters 2)");
   DID( 58, RW, hcratio, "Hcratio", F88, "OTC heat curve ratio (&deg;C) (Remote parameter 3)");
-  DID(100, RO, remote_override, "Remote override function", flag8_, "Function of manual and program changes in master and remoteroom setpoint.");
+  DID(100, RO, remote_override, "Remote override function", flag8_, "Function of manual and program changes in master and remoteroom setpoint");
   DID(115, RO, oem_diagnostic_code, "OEM diagnostic code", u16, "OEM-specific diagnostic/service code");
   DID(116, RW, burner_starts, "Burner starts", u16, "Number of starts burner");
   DID(117, RW, ch_pump_starts, "CH pump starts", u16, "Number of starts CH pump");
@@ -180,19 +182,49 @@ protected:
   DID(119, RW, dhw_burner_starts, "DHW burner starts", u16, "Number of starts burner during DHW mode");
   DID(120, RW, burner_ophours, "Burner operation hours", u16, "Number of hours that burner is in operation (i.e. flame on)");
   DID(121, RW, ch_pump_ophours, "CH pump operation hours", u16, "Number of hours that CH pump has been running");
-  DID(122, RW, dhw_pump_valve_ophours, "DHW pump/valve operation hours", u16, "Number of hours that DHW pump has been running or DHW valvehas been opened");
+  DID(122, RW, dhw_pump_valve_ophours, "DHW pump/valve operation hours", u16, "Number of hours that DHW pump has been running or DHW valve has been opened");
   DID(123, RW, dhw_burner_ophours, "DHW burner operation hours", u16, "Number of hours that burner is in operation during DHW mode");
-  DID(124, WO, ot_version_master, "OpenTherm version Master", F88, "The implemented version of the OpenTherm Protocol Specification in the master.");
-  DID(125, RO, ot_version_slave, "OpenTherm version Slave", F88, "The implemented version of the OpenTherm Protocol Specification in the slave.");
+  DID(124, WO, ot_version_master, "OpenTherm version Master", F88, "The implemented version of the OpenTherm Protocol Specification in the master");
+  DID(125, RO, ot_version_slave, "OpenTherm version Slave", F88, "The implemented version of the OpenTherm Protocol Specification in the slave");
   DID(126, WO, master_version, "Master-version", u8_u8, "Master product version number and type");
   DID(127, RO, slave_version, "Slave-version", u8_u8, "Slave product version number and type");
 
-  DID( 34, RO, heat_ex_temp, "Theatex", F88, "Boiler heat exchanger temperature (&deg;C)");
+  DID( 34, RO, theatex, "Theatex", F88, "Boiler heat exchanger temperature (&deg;C)");
   DID( 35, RW, boiler_fan_speed, "Boiler fan speed", u8_u8, "Boiler fan speed setpoint and actual value");
   DID( 36, RO, burner_flame_current, "Burner flame current", s16, "Electrical current through burner flame [µA]");
   DID( 37, WO, tr2, "Tr2", F88, "Room temperature for 2nd CH circuit (&deg;C)");
   DID( 38, RW, humidity, "Humidity", s16, "Relative Humidity");
   // clang-format on
+
+  virtual bool process(const Frame &f) {
+    switch (f.msg_type()) {
+    case ReadData:
+      on_read(f.id(), f.value());
+      return true;
+    case WriteData:
+      on_write(f.id(), f.value());
+      return true;
+    case InvalidData:
+      on_invalid_data(f.id(), f.value());
+      return true;
+    case ReadACK:
+      on_read_ack(f.id(), f.value());
+      return true;
+    case WriteACK:
+      on_write_ack(f.id(), f.value());
+      return true;
+    case DataInvalid:
+      on_data_invalid(f.id(), f.value());
+      return true;
+    case UnknownDataID:
+      on_unknown_data_id(f.id(), f.value());
+      return true;
+    }
+
+    return false;
+  }
+
+protected:
 
   virtual ID *find(uint8_t id) {
     for (auto d : index)
@@ -235,35 +267,6 @@ protected:
   virtual void on_write_ack(uint8_t data_id, uint16_t data_value) {}
   virtual void on_data_invalid(uint8_t data_id, uint16_t data_value) {}
   virtual void on_unknown_data_id(uint8_t data_id, uint16_t data_value) {}
-
-protected:
-  virtual bool process(const Frame &f) {
-    switch (f.msg_type()) {
-    case ReadData:
-      on_read(f.id(), f.value());
-      return true;
-    case WriteData:
-      on_write(f.id(), f.value());
-      return true;
-    case InvalidData:
-      on_invalid_data(f.id(), f.value());
-      return true;
-    case ReadACK:
-      on_read_ack(f.id(), f.value());
-      return true;
-    case WriteACK:
-      on_write_ack(f.id(), f.value());
-      return true;
-    case DataInvalid:
-      on_data_invalid(f.id(), f.value());
-      return true;
-    case UnknownDataID:
-      on_unknown_data_id(f.id(), f.value());
-      return true;
-    }
-
-    return false;
-  }
 
   static bool sprocess(Application &app, const Frame &f) {
     return app.process(f);

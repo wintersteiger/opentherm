@@ -265,7 +265,7 @@ public:
   TimeType time;
   IOType io;
   Frame rx_last;
-  uint64_t rx_frame_count = 0;
+  uint64_t rx_frame_count = 0, tx_frame_count = 0;
 
   virtual void start() = 0;
 
@@ -311,6 +311,7 @@ public:
   using DeviceT::rx_forever;
   using DeviceT::rx_once;
   using DeviceT::tx;
+  using DeviceT::tx_frame_count;
 
   Master(const Pins &pins)
       : DeviceT(pins), next_request_id(0), requests(max_concurrent_requests) {
@@ -480,6 +481,8 @@ public:
 
       if (req.callback && req.application)
         req.callback(req.application, r.status, r.id, r.f);
+
+      tx_frame_count++;
     }
   }
 
