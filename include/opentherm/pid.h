@@ -1,7 +1,12 @@
 #ifndef _OPENTHERM_PID_H_
 #define _OPENTHERM_PID_H_
 
+#include <math.h>
 #include <stdint.h>
+
+#include "ds.h"
+
+namespace OpenTherm {
 
 // From Brett Beauregard's excellent series of blog posts:
 // http://brettbeauregard.com/blog/2011/04/improving-the-beginners-pid-introduction/
@@ -21,17 +26,11 @@ public:
 
       float error = setpoint - input;
       cum_err += ki * (error * delta_t);
-      if (cum_err > max)
-        cum_err = max;
-      else if (cum_err < min)
-        cum_err = min;
+      cum_err = fmaxf(fminf(cum_err, max), min);
       float delta_input = input - prev_input;
 
       output = kp * error + cum_err + kd * delta_input;
-      if (output > max)
-        output = max;
-      else if (output < min)
-        output = min;
+      output = fmaxf(fminf(output, max), min);
 
       prev_time = now;
       prev_input = input;
@@ -40,11 +39,15 @@ public:
     return output;
   }
 
-  void set(float kp, float ki, float kd) {
+  void set_coefficients(float kp, float ki, float kd) {
     this->kp = kp;
     this->ki = ki;
     this->kd = kd;
   }
+
+  void set_setpoint(float sp) { this->setpoint = sp; }
+
+  float get_setpoint() const { return setpoint; }
 
   float get() const { return output; }
 
@@ -56,11 +59,7 @@ public:
 
   void initialize(float input) {
     prev_input = input;
-    cum_err = output;
-    if (cum_err > max)
-      cum_err = max;
-    else if (cum_err < min)
-      cum_err = min;
+    cum_err = fmaxf(fminf(output, max), min);
   }
 
 protected:
@@ -71,5 +70,7 @@ protected:
   uint64_t prev_time;
   bool automatic;
 };
+
+} // namespace OpenTherm
 
 #endif // _OPENTHERM_PID_H_

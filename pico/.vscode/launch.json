@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "Pico Debug",
-      "cwd": "${workspaceRoot}",
       "executable": "${workspaceFolder}/build/openthermostat.elf",
+      "cwd": "${workspaceFolder}/build",
       "request": "launch",
       "type": "cortex-debug",
       "servertype": "openocd",
@@ -70,6 +70,17 @@
           "ignoreFailures": true
         }
       ]
-    }
+    },
+    {
+      "type": "gdb",
+      "request": "attach",
+      "name": "Pico Debug Remote",
+      "executable": "${workspaceFolder}/build/openthermostat.elf",
+      "target": "192.168.0.31:3333",
+      "remote": true,
+      "cwd": "${workspaceRoot}/build",
+      "gdbpath": "gdb-multiarch",
+      "autorun": []
+  }
   ]
 }

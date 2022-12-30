@@ -100,48 +100,34 @@ public:
   virtual bool process_command(const CommandFrame &cmd_frame) override {
     static constexpr const size_t fsz = CommandFrame::serialized_size();
 
-    char buf[fsz];
-    bool q = cmd_frame.to_string(buf, sizeof(buf));
+    const std::lock_guard<std::mutex> lock(log_mtx);
+    std::cout << "\r";
 
     switch (cmd_frame.command_id) {
     case CommandID::INVALID: {
-      {
-        const std::lock_guard<std::mutex> lock(log_mtx);
-        std::cout << "\rX invalid command frame: " << buf << " (" << q << ")"
-                  << std::endl;
-      }
+      char buf[fsz];
+      bool q = cmd_frame.to_string(buf, sizeof(buf));
+      std::cout << "X invalid command frame: " << buf << " (" << q << ")";
       break;
     }
-    case CommandID::OPENTHERM_REQUEST: {
-      const std::lock_guard<std::mutex> lock(log_mtx);
-      std::cout << "\r? unexpected request: " << Frame(cmd_frame.payload).to_string() << std::endl;
+    case CommandID::CONFIRMATION:
+      std::cout << "> confirmed, status=" << cmd_frame.payload;
       break;
-    }
-    case CommandID::OPENTHERM_REPLY: {
-      Frame f(cmd_frame.payload);
-      {
-        const std::lock_guard<std::mutex> lock(log_mtx);
-        std::cout << "\r> " << to_string(f) << std::endl;
-      }
-      process(f);
-      request_id_rcvd = cmd_frame.user_data;
+    case CommandID::OPENTHERM_REPLY:
+      std::cout << "> " << to_string(Frame(cmd_frame.payload));
       break;
-    }
-    case CommandID::SET_STATUS: {
-      const std::lock_guard<std::mutex> lock(log_mtx);
-      std::cout << "\r> status := " << cmd_frame.payload << std::endl;
-      break;
-    }
-    case CommandID::SET_SETPOINT: {
-      const std::lock_guard<std::mutex> lock(log_mtx);
-      std::cout << "\r> setpoint := " << cmd_frame.payload << std::endl;
-      break;
-    }
     default: {
-      const std::lock_guard<std::mutex> lock(log_mtx);
-      std::cout << "\rX command frame with unknown command id "
-                << (int)static_cast<uint8_t>(cmd_frame.command_id) << std::endl;
+      std::cout << "X command frame with unhandled command id "
+                << (int)static_cast<uint8_t>(cmd_frame.command_id);
     }
+    }
+
+    std::cout << std::endl;
+
+    if (cmd_frame.command_id == CommandID::OPENTHERM_REPLY) {
+      process(Frame(cmd_frame.payload));
+      std::cout << std::endl;
+      request_id_rcvd = cmd_frame.user_data;
     }
 
     return true;
@@ -151,7 +137,7 @@ public:
     RichApplication::on_read_ack(id, value);
     Application::ID *idp = find(id);
     if (!idp)
-      printf("X unknown data ID");
+      printf("\rX unknown data ID");
     else {
       Application::IDMeta &meta = CLIApp::idmeta[id];
       printf("  %s == %s", meta.data_object, ID::to_string(meta.type, value));
@@ -163,14 +149,13 @@ public:
 
       idp->value = value;
     }
-    printf("\n");
   }
 
   virtual void on_write_ack(uint8_t id, uint16_t value = 0x0000) override {
     RichApplication::on_write_ack(id, value);
     Application::ID *idp = find(id);
     if (!idp)
-      printf("X unknown data ID");
+      printf("\rX unknown data ID");
     else {
       Application::IDMeta &meta = CLIApp::idmeta[id];
       printf("  %s := %s\n", meta.data_object, ID::to_string(meta.type, value));
@@ -202,7 +187,7 @@ static size_t WriteCallback(void *contents, size_t size, size_t nmemb,
   return size * nmemb;
 }
 
-std::string make_request(const std::string &url) {
+static std::string make_request(const std::string &url) {
   CURL *curl;
   std::string r;
 
@@ -223,8 +208,8 @@ std::string make_request(const std::string &url) {
                              curl_easy_strerror(code));
 }
 
-void mosquitto_on_msg(mosquitto *mosq, void *arg,
-                      const mosquitto_message *msg) {
+static void mosquitto_on_msg(mosquitto *mosq, void *arg,
+                             const mosquitto_message *msg) {
   static constexpr const size_t fsz = CommandFrame::serialized_size();
 
   if (msg->payloadlen == fsz) {
@@ -238,15 +223,15 @@ void mosquitto_on_msg(mosquitto *mosq, void *arg,
   }
 }
 
-void mosquitto_on_log(struct mosquitto *mosq, void *obj, int level,
-                      const char *str) {
+static void mosquitto_on_log(struct mosquitto *mosq, void *obj, int level,
+                             const char *str) {
   if (level < MOSQ_LOG_DEBUG) {
     const std::lock_guard<std::mutex> lock(log_mtx);
     std::cout << "- " << level << ": " << str << std::endl;
   }
 }
 
-void mosquitto_init() {
+static void mosquitto_init() {
   std::string host = "192.168.0.41";
   int port = 1883;
   int keepalive = 60;
@@ -286,7 +271,7 @@ void mosquitto_init() {
       int r = mosquitto_loop(mosq, 125, 1);
       if (r != MOSQ_ERR_SUCCESS) {
         const std::lock_guard<std::mutex> lock(log_mtx);
-        std::cout << "! MQTT reconnecting..." << std::endl;
+        std::cout << "! Mosquitto reconnecting..." << std::endl;
         mosquitto_reconnect(mosq);
       }
     }
@@ -295,7 +280,7 @@ void mosquitto_init() {
   r = mosquitto_subscribe(mosq, NULL, mosq_cmd_out_topic, 0);
 }
 
-void send_msg(const CommandFrame &cf) {
+static void send_cmd(const CommandFrame &cf) {
   static constexpr const size_t fsz = CommandFrame::serialized_size();
 
   CommandFrame tcf = cf;
@@ -310,11 +295,28 @@ void send_msg(const CommandFrame &cf) {
   {
     const std::lock_guard<std::mutex> lock(log_mtx);
     std::cout << "\r< ";
-    if (cf.command_id == CommandID::OPENTHERM_REQUEST)
-      std::cout << Frame(cf.payload).to_string() << " [" << msg_hex << "]"
-                << std::endl;
-    else
-      std::cout << msg_hex << std::endl;
+
+    switch (cf.command_id) {
+    case CommandID::OPENTHERM_REQUEST:
+      std::cout << Frame(cf.payload).to_string();
+      break;
+    case CommandID::SET_STATUS: {
+      std::cout << "status := " << tcf.payload;
+      break;
+    }
+    case CommandID::SET_SETPOINT: {
+      std::cout << "setpoint := " << to_f88((uint16_t)tcf.payload);
+      break;
+    }
+    case CommandID::TEMPERATURE_REPORT: {
+      std::cout << "temperature report := " << to_f88((uint16_t)tcf.payload);
+      break;
+    }
+    default:
+      std::cout << " ?";
+    }
+
+    std::cout << " [" << msg_hex << "]" << std::endl;
   }
 
   auto before = std::chrono::system_clock::now();
@@ -322,7 +324,7 @@ void send_msg(const CommandFrame &cf) {
                                msg_hex, 0, false);
   if (err != MOSQ_ERR_SUCCESS) {
     const std::lock_guard<std::mutex> lock(log_mtx);
-    std::cout << "X error: " << (unsigned)err << std::endl;
+    std::cout << "\rX error: " << (unsigned)err << std::endl;
   }
   static const char prog_chars[] = {'-', '\\', '|', '/'};
   int pci = 0;
@@ -336,11 +338,14 @@ void send_msg(const CommandFrame &cf) {
     std::cout << '\r' << prog_chars[pci];
     pci = (pci + 1) % 4;
     std::cout.flush();
-    std::this_thread::sleep_for(100ms);
+    std::this_thread::sleep_for(25ms);
   } while (tcf.user_data < request_id_rcvd);
+
+  // Give mosquitto thread time to handle everything.
+  std::this_thread::sleep_for(250ms);
 }
 
-void send_msg(CommandFrame &&cf) { send_msg(cf); }
+static void send_cmd(CommandFrame &&cf) { send_cmd(cf); }
 
 static void trim(std::string &str) {
   size_t fs = str.find_first_not_of(" ");
@@ -414,11 +419,11 @@ static void register_cmds() {
     }
 
     if (num == 1) {
-      send_msg(CommandFrame(CommandID::OPENTHERM_REQUEST, 0,
+      send_cmd(CommandFrame(CommandID::OPENTHERM_REQUEST, 0,
                             (uint32_t)Frame(MsgType::ReadData, id)));
     } else {
       for (uint16_t i = 0; i < num; i++) {
-        send_msg(CommandFrame(CommandID::OPENTHERM_REQUEST, 0,
+        send_cmd(CommandFrame(CommandID::OPENTHERM_REQUEST, 0,
                               Frame(MsgType::ReadData, id + i)));
         std::this_thread::sleep_for(250ms);
       }
@@ -434,8 +439,35 @@ static void register_cmds() {
     uint16_t value = 0;
     if (sscanf(args[1].c_str(), "%04" SCNx16, &value) != 1)
       throw std::runtime_error("invalid data value");
-    send_msg(CommandFrame(CommandID::OPENTHERM_REQUEST, 0,
+    send_cmd(CommandFrame(CommandID::OPENTHERM_REQUEST, 0,
                           (uint32_t)Frame(MsgType::WriteData, id, value)));
+  };
+
+  cmds["status"] = [](auto &args) {
+    if (args.size() != 1)
+      throw std::runtime_error("invalid number of arguments");
+    uint8_t status = 0x00;
+    if (sscanf(args[0].c_str(), "%02hhx", &status) != 1)
+      throw std::runtime_error("invalid value");
+    send_cmd(CommandFrame(CommandID::SET_STATUS, 0, status));
+  };
+
+  cmds["set"] = [](auto &args) {
+    if (args.size() != 1)
+      throw std::runtime_error("invalid number of arguments");
+    float f = 0.0f;
+    if (sscanf(args[0].c_str(), "%f", &f) != 1 || f < 0.0 || f > 80.0)
+      throw std::runtime_error("invalid value");
+    send_cmd(CommandFrame(CommandID::SET_SETPOINT, 0, from_f88(f)));
+  };
+
+  cmds["rep"] = [](auto &args) {
+    if (args.size() != 1)
+      throw std::runtime_error("invalid number of arguments");
+    float f = 0.0f;
+    if (sscanf(args[0].c_str(), "%f", &f) != 1)
+      throw std::runtime_error("invalid value");
+    send_cmd(CommandFrame(CommandID::TEMPERATURE_REPORT, 0, from_f88(f)));
   };
 }
 
@@ -456,12 +488,12 @@ int main(int argc, const char **argv) {
     mosquitto_init();
 
     if (argc <= 1)
-      send_msg(
+      send_cmd(
           CommandFrame(CommandID::OPENTHERM_REQUEST, 0, (uint32_t)Frame(0)));
     else {
       for (size_t i = 1; i < argc; i++) {
         try {
-          send_msg(CommandFrame(CommandID::OPENTHERM_REQUEST, 0,
+          send_cmd(CommandFrame(CommandID::OPENTHERM_REQUEST, 0,
                                 (uint32_t)from_hex(argv[i])));
         } catch (const std::exception &ex) {
           const std::lock_guard<std::mutex> lock(log_mtx);

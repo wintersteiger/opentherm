@@ -186,6 +186,7 @@ public:
         pid(10.0, 10.0 / 50.0, 10.0 * 1.0, 0.0, 80.0),
         pid_timer(0, 1000000, on_pid_timer_cb, nullptr, this) {
     device.set_frame_callback(Application::sprocess, this);
+    pid.set_automatic(true, 0.0);
   }
 
   virtual ~MyApp() = default;
@@ -205,9 +206,8 @@ public:
   }
 
   virtual bool process_command(const CommandFrame &cmd_frame) override {
-    char buf[CommandFrame::serialized_size()];
-    bool q = cmd_frame.to_string(buf, sizeof(buf));
-    llog("process_command: %s (%d)", buf, q);
+    llog("Command(%02" PRIx8 ", %04" PRIx16 ", %08" PRIx32 ")",
+         cmd_frame.command_id, cmd_frame.user_data, cmd_frame.payload);
 
     switch (cmd_frame.command_id) {
     case CommandID::OPENTHERM_REQUEST: {
@@ -220,8 +220,10 @@ public:
             if (req.rid != rid)
               llog("warning: outdated MQTT request ID");
             req.rid = NoRequestID;
-            app->mqtt_publish_cmd_response(s, req.user_data, f);
-            app->mqtt_num_active_cmd_requests--;
+            if (s == RequestStatus::OK)
+              app->mqtt_publish_cmd_response(req.user_data, f);
+            else
+              app->mqtt_publish_cmd_response(req.user_data, s);
           });
 
       if (rid == NoRequestID) {
@@ -231,23 +233,34 @@ public:
       } else {
         mqtt_cmd_requests[rid % mqtt_max_concurrent_requests] = {
             .rid = rid, .user_data = cmd_frame.user_data};
-        mqtt_num_active_cmd_requests++;
         return true;
       }
       break;
     }
     case CommandID::INVALID: {
-      mqtt_publish_cmd_response(RequestStatus::SKIPPED, cmd_frame.user_data, 0);
+      mqtt_publish_cmd_response(cmd_frame.user_data, RequestStatus::ERROR);
       return false;
     }
     case CommandID::SET_STATUS: {
-      configuration.status = cmd_frame.payload & 0x00FF;
+      configuration.status = cmd_frame.payload & 0x000000FF;
+      llog("* New status: %02" PRIx8, configuration.status);
+      tx(Frame(ReadData, 0, configuration.status, 0x00));
+      mqtt_publish_cmd_response(cmd_frame.user_data, RequestStatus::OK);
       return true;
     }
     case CommandID::SET_SETPOINT: {
-      float v = (cmd_frame.payload & 0x0000FFFF) / 256.0f;
-      llog("new setpoint: %.2f", v);
-      configuration.setpoint = v;
+      float sp = to_f88((uint16_t)(cmd_frame.payload & 0x0000FFFF));
+      llog("* New setpoint: %.2f", sp);
+      configuration.setpoint = sp;
+      pid.set_setpoint(sp);
+      mqtt_publish_cmd_response(cmd_frame.user_data, RequestStatus::OK);
+      return true;
+    }
+    case CommandID::TEMPERATURE_REPORT: {
+      float t = to_f88((uint16_t)(cmd_frame.payload & 0x0000FFFF));
+      float o = pid.update(t);
+      llog("Report: %f; PID output: %f", t, o);
+      mqtt_publish_cmd_response(cmd_frame.user_data, RequestStatus::OK);
       return true;
     }
     default:
@@ -350,7 +363,6 @@ protected:
   static constexpr const size_t mqtt_max_concurrent_requests = 16;
 
   MQTTRequest mqtt_cmd_requests[mqtt_max_concurrent_requests];
-  size_t mqtt_num_active_cmd_requests = 0;
   char mosq_cmd_hex[CommandFrame::serialized_size() *
                     mqtt_max_concurrent_requests];
   size_t mosq_data_arrived = 0;
@@ -468,14 +480,28 @@ protected:
     }
   }
 
-  void mqtt_publish_cmd_response(RequestStatus s, uint16_t user_id,
-                                 const Frame &f) {
+  void mqtt_publish_cmd_response(uint16_t user_id, const Frame &f) {
     CommandFrame cf(CommandID::OPENTHERM_REPLY, user_id, (uint32_t)f);
 
     MQTTPublishRequest req;
     req.topic = mqtt_cmd_out_topic;
-    if (!cf.to_string(req.payload, sizeof(req.payload)))
+    if (!cf.to_string(req.payload, sizeof(req.payload))) {
+      llog("cf.to_string failed");
       snprintf(req.payload, sizeof(req.payload), "00%04x00000000", user_id);
+    }
+    req.length = cf.serialized_size();
+    mqtt_publish_queue_add(req);
+  }
+
+  void mqtt_publish_cmd_response(uint16_t user_id, RequestStatus s) {
+    CommandFrame cf(CommandID::CONFIRMATION, user_id, static_cast<uint32_t>(s));
+
+    MQTTPublishRequest req;
+    req.topic = mqtt_cmd_out_topic;
+    if (!cf.to_string(req.payload, sizeof(req.payload))) {
+      llog("cf.to_string failed");
+      snprintf(req.payload, sizeof(req.payload), "00%04x00000000", user_id);
+    }
     req.length = cf.serialized_size();
     mqtt_publish_queue_add(req);
   }
@@ -835,6 +861,10 @@ void httpd_cgi_handler(struct fs_file *file, const char *uri, int num_params,
 }
 
 static void core1_main(void) {
+  multicore_lockout_victim_init();
+  exception_set_exclusive_handler(HARDFAULT_EXCEPTION,
+                                  hard_fault_exception_handler);
+
   // pio_interrupt_clear(pio0, 0);
   // pio_set_irq0_source_enabled(pio0, pis_interrupt0, true);
   // irq_set_exclusive_handler(PIO0_IRQ_0, []() {
@@ -845,15 +875,14 @@ static void core1_main(void) {
   // });
   // irq_set_enabled(PIO0_IRQ_0, true);
 
-  exception_set_exclusive_handler(HARDFAULT_EXCEPTION,
-                                  hard_fault_exception_handler);
-
   app.tx_forever();
 }
 
 int main() {
+  multicore_lockout_victim_init();
   exception_set_exclusive_handler(HARDFAULT_EXCEPTION,
                                   hard_fault_exception_handler);
+
   stdio_init_all();
   sleep_ms(1000);
 

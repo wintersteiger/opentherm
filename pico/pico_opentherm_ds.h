@@ -132,9 +132,7 @@ public:
   PicoTime() : Time() {}
   virtual ~PicoTime() = default;
   virtual uint64_t get_us() const override { return time_us_64(); }
-  virtual void sleep_us(uint64_t us) const override {
-    return ::busy_wait_us(us);
-  }
+  virtual void sleep_us(uint64_t us) const override { ::busy_wait_us(us); }
 };
 
 class PicoIO : public OpenTherm::IO {

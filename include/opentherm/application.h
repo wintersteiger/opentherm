@@ -13,10 +13,12 @@ namespace OpenTherm {
 
 enum class CommandID : uint8_t {
   INVALID = 0,
-  OPENTHERM_REQUEST = 1,
-  OPENTHERM_REPLY = 2,
-  SET_STATUS = 3,
-  SET_SETPOINT = 4
+  CONFIRMATION = 1,
+  OPENTHERM_REQUEST = 2,
+  OPENTHERM_REPLY = 3,
+  SET_STATUS = 4,
+  SET_SETPOINT = 5,
+  TEMPERATURE_REPORT = 6
 };
 
 #pragma pack(push, 1)
@@ -54,6 +56,18 @@ public:
   static constexpr const size_t serialized_size() { return 14 + 1; }
 };
 #pragma pack(pop)
+
+static float to_f88(int16_t v) {
+  return v / 256.0f;
+}
+
+static float to_f88(uint16_t v) {
+  return to_f88((int16_t)v);
+}
+
+static uint16_t from_f88(float f) {
+  return f * 256.0f;
+}
 
 class Application {
 public:
@@ -114,7 +128,7 @@ public:
     }
 
     ID &operator=(float v) {
-      value = v / 256.0;
+      value = from_f88(v);
       return *this;
     }
 
@@ -125,7 +139,7 @@ public:
         snprintf(buf, sizeof(buf), "%02x/%02x", value >> 8, value & 0x00FF);
         break;
       case F88: {
-        float f = ((signed)value) / 256.0f;
+        float f = to_f88(value);
         snprintf(buf, sizeof(buf), "%.2f", f);
         break;
       }
