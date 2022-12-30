@@ -158,7 +158,9 @@ void mosquitto_on_msg(mosquitto *mosq, void *arg,
     }
   } else if (msg->payloadlen == fsz) {
     CommandFrame cmd_frame(static_cast<const char*>(msg->payload), msg->payloadlen);
-    std::cout << "\r> command frame " << msg->payload << std::endl;
+    char buf[fsz];
+    cmd_frame.to_string(buf, fsz);
+    std::cout << "\r> command frame: " << buf << std::endl;
     // We don't log commands/replies.
   } else
     std::cout << "unknown message of length " << msg->payloadlen << std::endl;
