@@ -57,11 +57,6 @@ public:
     automatic = v;
   }
 
-  void initialize(float input) {
-    prev_input = input;
-    cum_err = fmaxf(fminf(output, max), min);
-  }
-
 protected:
   TimeType time;
   float kp, ki, kd;
@@ -69,6 +64,12 @@ protected:
   float output, setpoint, cum_err, prev_input;
   uint64_t prev_time;
   bool automatic;
+
+  void initialize(float input) {
+    prev_input = input;
+    cum_err = fmaxf(fminf(output, max), min);
+    // Note: also recored prev_time = now?
+  }
 };
 
 } // namespace OpenTherm
