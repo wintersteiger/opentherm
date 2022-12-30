@@ -92,5 +92,22 @@
 #define MEMP_NUM_SYS_TIMEOUT LWIP_NUM_SYS_TIMEOUT_INTERNAL + 5
 
 #define MQTT_REQ_MAX_IN_FLIGHT        16
+#define MQTT_REQ_TIMEOUT              1
+
+// Core locking is required for MQTT?
+// See https://community.nxp.com/t5/MCUXpresso-SDK/MCUX-SDK-and-lwIP-using-LWIP-ASSERT-CORE-LOCKED/m-p/1005990
+#define LWIP_TCPIP_CORE_LOCKING       1
+
+#if LWIP_TCPIP_CORE_LOCKING
+#ifdef __cplusplus
+extern "C" {
+#endif
+void lwip_assert_core_locked(void);
+#define LWIP_ASSERT_CORE_LOCKED() do { lwip_assert_core_locked(); } while (0)
+#ifdef __cplusplus
+}
+#endif
+#endif // LWIP_TCPIP_CORE_LOCKING‍‍‍‍‍‍‍‍‍‍‍‍‍‍‍‍‍‍‍‍‍‍‍‍‍‍‍‍‍‍
+
 
 #endif

@@ -12,10 +12,6 @@
 
 // OpenTherm 2.2 transport layer
 
-#ifndef PRIu64
-#define PRIu64 "%llu"
-#endif
-
 namespace OpenTherm {
 
 struct Frame;
@@ -28,7 +24,7 @@ public:
 
   virtual void acquire_blocking() = 0;
   virtual bool acquire_timeout(uint64_t us) = 0;
-  virtual void release() = 0;
+  virtual bool release() = 0;
   virtual bool try_acquire() = 0;
 };
 
@@ -283,7 +279,7 @@ public:
       if (blink)
         blink(true);
       if (!process(f))
-        io.log("Dev: frame processing failed: %08lx", (uint32_t)f);
+        io.log("Dev: frame processing failed: %08" PRIx32, (uint32_t)f);
       if (blink)
         blink(false);
     }

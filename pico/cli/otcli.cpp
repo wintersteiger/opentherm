@@ -34,107 +34,9 @@ static bool mosq_thread_running = false;
 static const char *mosq_cmd_in_topic = "OpenThermOstat/command/in";
 static const char *mosq_cmd_out_topic = "OpenThermOstat/command/out";
 
-class CLIDevice : public DeviceBase {
-public:
-  CLIDevice() = default;
-  virtual ~CLIDevice() = default;
-
-  virtual RequestID tx(const Frame &f, bool skip_if_busy = false,
-                       void (*callback)(Application *, RequestStatus, RequestID,
-                                        const Frame &) = nullptr,
-                       Application *app = nullptr) override {
-    return NoRequestID;
-  }
-};
-
-class CLIApp : public RichApplication {
-public:
-  CLIApp() : device(), RichApplication(device) {
-    device.set_frame_callback(Application::sprocess, this);
-  }
-  virtual ~CLIApp() = default;
-
-  virtual void run() override {}
-
-  virtual void on_read_ack(uint8_t id, uint16_t value = 0x0000) override {
-    RichApplication::on_read_ack(id, value);
-    Application::ID *idp = find(id);
-    if (!idp)
-      printf("X unknown data ID");
-    else {
-      Application::IDMeta &meta = CLIApp::idmeta[id];
-      printf("  %s == %s", meta.data_object, ID::to_string(meta.type, value));
-
-      if (id == 0) {
-        printf("\t\tfault: %d ch: %d dhw: %d flame: %d", (value & 0x01) != 0,
-               (value & 0x02) != 0, (value & 0x04) != 0, (value & 0x08) != 0);
-      }
-
-      idp->value = value;
-    }
-    printf("\n");
-  }
-
-  virtual void on_write_ack(uint8_t id, uint16_t value = 0x0000) override {
-    RichApplication::on_write_ack(id, value);
-    Application::ID *idp = find(id);
-    if (!idp)
-      printf("X unknown data ID");
-    else {
-      Application::IDMeta &meta = CLIApp::idmeta[id];
-      printf("  %s := %s\n", meta.data_object, ID::to_string(meta.type, value));
-      idp->value = value;
-    }
-  }
-
-protected:
-  CLIDevice device;
-};
-
-static CLIApp app;
 static auto command_timeout = 2s;
 static volatile uint16_t next_request_id = 0;
 static volatile uint16_t request_id_rcvd = -1;
-static Frame last_frame;
-
-static std::map<std::string,
-                std::function<void(const std::vector<std::string> &)>>
-    cmds;
-
-Frame from_hex(const std::string &hex) {
-  uint32_t msg;
-  if (sscanf(hex.c_str(), "%08x", &msg) != 1)
-    throw std::runtime_error(std::string("erroneous message: ") + hex +
-                             " is not a valid hex-encoded frame");
-  return Frame(msg);
-}
-
-static size_t WriteCallback(void *contents, size_t size, size_t nmemb,
-                            void *userp) {
-  ((std::string *)userp)->append((char *)contents, size * nmemb);
-  return size * nmemb;
-}
-
-std::string make_request(const std::string &url) {
-  CURL *curl;
-  std::string r;
-
-  curl = curl_easy_init();
-  if (!curl)
-    throw std::runtime_error("curl init failure");
-
-  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r);
-  CURLcode code = curl_easy_perform(curl);
-  curl_easy_cleanup(curl);
-
-  if (code == CURLE_OK)
-    return r;
-  else
-    throw std::runtime_error(std::string("curl error: ") +
-                             curl_easy_strerror(code));
-}
 
 std::string to_string(const Frame &f) {
   using namespace OpenTherm;
@@ -173,25 +75,167 @@ std::string to_string(const Frame &f) {
   return ss.str();
 }
 
+class CLIDevice : public DeviceBase {
+public:
+  CLIDevice() = default;
+  virtual ~CLIDevice() = default;
+
+  virtual RequestID tx(const Frame &f, bool skip_if_busy = false,
+                       void (*callback)(Application *, RequestStatus, RequestID,
+                                        const Frame &) = nullptr,
+                       Application *app = nullptr) override {
+    return NoRequestID;
+  }
+};
+
+class CLIApp : public RichApplication {
+public:
+  CLIApp() : device(), RichApplication(device) {
+    device.set_frame_callback(Application::sprocess, this);
+  }
+  virtual ~CLIApp() = default;
+
+  virtual void run() override {}
+
+  virtual bool process_command(const CommandFrame &cmd_frame) override {
+    static constexpr const size_t fsz = CommandFrame::serialized_size();
+
+    char buf[fsz];
+    bool q = cmd_frame.to_string(buf, sizeof(buf));
+
+    switch (cmd_frame.command_id) {
+    case CommandID::INVALID: {
+      {
+        const std::lock_guard<std::mutex> lock(log_mtx);
+        std::cout << "\rX invalid command frame: " << buf << " (" << q << ")"
+                  << std::endl;
+      }
+      break;
+    }
+    case CommandID::OPENTHERM_REQUEST: {
+      const std::lock_guard<std::mutex> lock(log_mtx);
+      std::cout << "\r? unexpected request: " << Frame(cmd_frame.payload).to_string() << std::endl;
+      break;
+    }
+    case CommandID::OPENTHERM_REPLY: {
+      Frame f(cmd_frame.payload);
+      {
+        const std::lock_guard<std::mutex> lock(log_mtx);
+        std::cout << "\r> " << to_string(f) << std::endl;
+      }
+      process(f);
+      request_id_rcvd = cmd_frame.user_data;
+      break;
+    }
+    case CommandID::SET_STATUS: {
+      const std::lock_guard<std::mutex> lock(log_mtx);
+      std::cout << "\r> status := " << cmd_frame.payload << std::endl;
+      break;
+    }
+    case CommandID::SET_SETPOINT: {
+      const std::lock_guard<std::mutex> lock(log_mtx);
+      std::cout << "\r> setpoint := " << cmd_frame.payload << std::endl;
+      break;
+    }
+    default: {
+      const std::lock_guard<std::mutex> lock(log_mtx);
+      std::cout << "\rX command frame with unknown command id "
+                << (int)static_cast<uint8_t>(cmd_frame.command_id) << std::endl;
+    }
+    }
+
+    return true;
+  }
+
+  virtual void on_read_ack(uint8_t id, uint16_t value = 0x0000) override {
+    RichApplication::on_read_ack(id, value);
+    Application::ID *idp = find(id);
+    if (!idp)
+      printf("X unknown data ID");
+    else {
+      Application::IDMeta &meta = CLIApp::idmeta[id];
+      printf("  %s == %s", meta.data_object, ID::to_string(meta.type, value));
+
+      if (id == 0) {
+        printf("\t\tfault: %d ch: %d dhw: %d flame: %d", (value & 0x01) != 0,
+               (value & 0x02) != 0, (value & 0x04) != 0, (value & 0x08) != 0);
+      }
+
+      idp->value = value;
+    }
+    printf("\n");
+  }
+
+  virtual void on_write_ack(uint8_t id, uint16_t value = 0x0000) override {
+    RichApplication::on_write_ack(id, value);
+    Application::ID *idp = find(id);
+    if (!idp)
+      printf("X unknown data ID");
+    else {
+      Application::IDMeta &meta = CLIApp::idmeta[id];
+      printf("  %s := %s\n", meta.data_object, ID::to_string(meta.type, value));
+      idp->value = value;
+    }
+  }
+
+protected:
+  CLIDevice device;
+};
+
+static CLIApp app;
+
+static std::map<std::string,
+                std::function<void(const std::vector<std::string> &)>>
+    cmds;
+
+Frame from_hex(const std::string &hex) {
+  uint32_t msg;
+  if (sscanf(hex.c_str(), "%08" SCNx32, &msg) != 1)
+    throw std::runtime_error(std::string("erroneous message: ") + hex +
+                             " is not a valid hex-encoded frame");
+  return Frame(msg);
+}
+
+static size_t WriteCallback(void *contents, size_t size, size_t nmemb,
+                            void *userp) {
+  ((std::string *)userp)->append((char *)contents, size * nmemb);
+  return size * nmemb;
+}
+
+std::string make_request(const std::string &url) {
+  CURL *curl;
+  std::string r;
+
+  curl = curl_easy_init();
+  if (!curl)
+    throw std::runtime_error("curl init failure");
+
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r);
+  CURLcode code = curl_easy_perform(curl);
+  curl_easy_cleanup(curl);
+
+  if (code == CURLE_OK)
+    return r;
+  else
+    throw std::runtime_error(std::string("curl error: ") +
+                             curl_easy_strerror(code));
+}
+
 void mosquitto_on_msg(mosquitto *mosq, void *arg,
                       const mosquitto_message *msg) {
-  const std::lock_guard<std::mutex> lock(log_mtx);
-  if (msg->payloadlen == 12) {
-    uint16_t rid = 0;
-    uint32_t otmsg = 0;
-    if (sscanf((char *)msg->payload, "%04hx%08x", &rid, &otmsg) != 2)
-      std::cout
-          << "X erroneous message: %s is not a hex-encoded request ID and "
-             "OpenTherm frame"
-          << std::endl;
-    else {
-      last_frame = Frame(otmsg);
-      std::cout << "\r> " << to_string(last_frame) << std::endl;
-      app.process(last_frame);
-      request_id_rcvd = rid;
-    }
-  } else
-    std::cout << "X unknown message of length " << msg->payloadlen << std::endl;
+  static constexpr const size_t fsz = CommandFrame::serialized_size();
+
+  if (msg->payloadlen == fsz) {
+    CommandFrame cmd_frame(static_cast<const char *>(msg->payload),
+                           msg->payloadlen);
+    app.process_command(cmd_frame);
+  } else {
+    const std::lock_guard<std::mutex> lock(log_mtx);
+    std::cout << "\rX unknown message of length " << msg->payloadlen
+              << std::endl;
+  }
 }
 
 void mosquitto_on_log(struct mosquitto *mosq, void *obj, int level,
@@ -221,8 +265,8 @@ void mosquitto_init() {
     }
   });
 
-  const char* user = std::getenv("MQTT_USER");
-  const char* password = std::getenv("MQTT_PASS");
+  const char *user = std::getenv("MQTT_USER");
+  const char *password = std::getenv("MQTT_PASS");
 
   if (!user || !password)
     throw std::runtime_error("missing MQTT auth settings");
@@ -251,19 +295,31 @@ void mosquitto_init() {
   r = mosquitto_subscribe(mosq, NULL, mosq_cmd_out_topic, 0);
 }
 
-void send_msg(const Frame &f) {
+void send_msg(const CommandFrame &cf) {
+  static constexpr const size_t fsz = CommandFrame::serialized_size();
+
+  CommandFrame tcf = cf;
+  tcf.user_data = next_request_id++;
+
+  if (tcf.command_id == CommandID::OPENTHERM_REQUEST)
+    app.process(Frame(tcf.payload));
+
+  char msg_hex[fsz];
+  tcf.to_string(msg_hex, sizeof(msg_hex));
+
   {
     const std::lock_guard<std::mutex> lock(log_mtx);
-    std::cout << "\r< " << to_string(f) << std::endl;
+    std::cout << "\r< ";
+    if (cf.command_id == CommandID::OPENTHERM_REQUEST)
+      std::cout << Frame(cf.payload).to_string() << " [" << msg_hex << "]"
+                << std::endl;
+    else
+      std::cout << msg_hex << std::endl;
   }
-  app.process(f);
-  char msg_hex[13];
-  uint16_t request_id = next_request_id++;
-  int len =
-      snprintf(msg_hex, sizeof(msg_hex), "%04x%08x", request_id, (uint32_t)f);
+
   auto before = std::chrono::system_clock::now();
-  auto err =
-      mosquitto_publish(mosq, NULL, mosq_cmd_in_topic, len, msg_hex, 0, false);
+  auto err = mosquitto_publish(mosq, NULL, mosq_cmd_in_topic, sizeof(msg_hex),
+                               msg_hex, 0, false);
   if (err != MOSQ_ERR_SUCCESS) {
     const std::lock_guard<std::mutex> lock(log_mtx);
     std::cout << "X error: " << (unsigned)err << std::endl;
@@ -281,10 +337,10 @@ void send_msg(const Frame &f) {
     pci = (pci + 1) % 4;
     std::cout.flush();
     std::this_thread::sleep_for(100ms);
-  } while (request_id < request_id_rcvd);
+  } while (tcf.user_data < request_id_rcvd);
 }
 
-void send_msg(Frame &&f) { send_msg(f); }
+void send_msg(CommandFrame &&cf) { send_msg(cf); }
 
 static void trim(std::string &str) {
   size_t fs = str.find_first_not_of(" ");
@@ -339,12 +395,34 @@ static void handle_line(std::string &line, volatile bool &keep_running) {
 
 static void register_cmds() {
   cmds["read"] = [](auto &args) {
-    if (args.size() != 1)
+    uint16_t num = 1;
+
+    if (args.size() != 1 && args.size() != 2)
       throw std::runtime_error("invalid number of arguments");
+
     int id = 0;
     if (sscanf(args[0].c_str(), "%d", &id) != 1 | id > 255)
       throw std::runtime_error("invalid data id");
-    send_msg(Frame(MsgType::ReadData, id, (uint16_t)0));
+
+    if (args.size() == 2) {
+      int to = 0;
+      if (sscanf(args[1].c_str(), "%d", &to) != 1 | to > 255)
+        throw std::runtime_error("invalid data id");
+      if (id > to)
+        throw std::runtime_error("from must be smaller than to");
+      num = to - id + 1;
+    }
+
+    if (num == 1) {
+      send_msg(CommandFrame(CommandID::OPENTHERM_REQUEST, 0,
+                            (uint32_t)Frame(MsgType::ReadData, id)));
+    } else {
+      for (uint16_t i = 0; i < num; i++) {
+        send_msg(CommandFrame(CommandID::OPENTHERM_REQUEST, 0,
+                              Frame(MsgType::ReadData, id + i)));
+        std::this_thread::sleep_for(250ms);
+      }
+    }
   };
 
   cmds["write"] = [](auto &args) {
@@ -354,9 +432,10 @@ static void register_cmds() {
     if (sscanf(args[0].c_str(), "%d", &id) != 1 | id > 255)
       throw std::runtime_error("invalid data id");
     uint16_t value = 0;
-    if (sscanf(args[1].c_str(), "%04hx", &value) != 1)
+    if (sscanf(args[1].c_str(), "%04" SCNx16, &value) != 1)
       throw std::runtime_error("invalid data value");
-    send_msg(Frame(MsgType::WriteData, id, value));
+    send_msg(CommandFrame(CommandID::OPENTHERM_REQUEST, 0,
+                          (uint32_t)Frame(MsgType::WriteData, id, value)));
   };
 }
 
@@ -377,11 +456,13 @@ int main(int argc, const char **argv) {
     mosquitto_init();
 
     if (argc <= 1)
-      send_msg(Frame(0));
+      send_msg(
+          CommandFrame(CommandID::OPENTHERM_REQUEST, 0, (uint32_t)Frame(0)));
     else {
       for (size_t i = 1; i < argc; i++) {
         try {
-          send_msg(from_hex(argv[i]));
+          send_msg(CommandFrame(CommandID::OPENTHERM_REQUEST, 0,
+                                (uint32_t)from_hex(argv[i])));
         } catch (const std::exception &ex) {
           const std::lock_guard<std::mutex> lock(log_mtx);
           std::cout << "\rX Skipping invalid frame '" << argv[i]

@@ -1,9 +1,9 @@
 #ifndef _PICO_OPENTHERM_DS_H_
 #define _PICO_OPENTHERM_DS_H_
 
+#include <hardware/pio.h>
 #include <hardware/timer.h>
 #include <pico/util/queue.h>
-#include <hardware/pio.h>
 
 #include <opentherm/transport.h>
 
@@ -18,8 +18,7 @@ public:
 
   PicoTimer(uint64_t delay_us, uint64_t period_us, callback_t ftick,
             callback_t fstop = nullptr, void *data = nullptr)
-      : Timer(delay_us, period_us, ftick, fstop, data)
-  {
+      : Timer(delay_us, period_us, ftick, fstop, data) {
     if (!alarm_pool)
       alarm_pool = alarm_pool_create(2, 16);
   }
@@ -89,10 +88,7 @@ public:
   virtual ~PicoSemaphore() = default;
   virtual void acquire_blocking() override { sem_acquire_blocking(&sem); }
   virtual bool try_acquire() override { return sem_try_acquire(&sem); }
-  virtual void release() override {
-    if (!sem_release(&sem))
-      llog("sem_release failed");
-  }
+  virtual bool release() override { return sem_release(&sem); }
   virtual bool acquire_timeout(uint64_t us) override {
     return sem_acquire_timeout_us(&sem, us);
   }

@@ -1,15 +1,18 @@
 #include <stdio.h>
 
+#include "lwipopts.h"
+
 #include <boards/pico_w.h>
 
 #include <hardware/adc.h>
 #include <hardware/clocks.h>
 #include <hardware/exception.h>
-#include <hardware/pll.h>
 #include <hardware/flash.h>
+#include <hardware/pll.h>
 #include <pico/cyw43_arch.h>
 #include <pico/multicore.h>
 #include <pico/mutex.h>
+#include <pico/platform.h>
 #include <pico/stdlib.h>
 #include <pico/unique_id.h>
 
@@ -17,12 +20,26 @@
 #include <lwip/apps/httpd.h>
 #include <lwip/apps/mqtt.h>
 #include <lwip/stats.h>
+#include <lwip/sys.h>
 #include <lwip/tcpip.h>
 
 #include <opentherm/application.h>
+#include <opentherm/pid.h>
 #include <opentherm/transport.h>
 
+#include "hardware/timer.h"
 #include "pico_opentherm_ds.h"
+
+#if LWIP_TCPIP_CORE_LOCKING
+extern "C" {
+extern sys_mutex_t lock_tcpip_core;
+void lwip_assert_core_locked(void) {
+  LWIP_ASSERT("TCP/IP mutex is valid", sys_mutex_valid(lock_tcpip_core));
+  // Check whether we are in an ISR?
+  // LWIP_ASSERT("TCP/IP mutex is locked", ... );
+}
+}
+#endif
 
 using namespace OpenTherm;
 
@@ -55,31 +72,55 @@ float get_core_temperature() {
 }
 
 static void hard_fault_exception_handler(void) {
-  ::llog("EXCEPTION: HARD FAULT");
+  ::llog("EXCEPTION: HARD FAULT ON CORE %d", get_core_num());
   while (true)
     ;
 }
 
+static uint64_t flash_size() {
+  static constexpr const size_t flash_cmd_size = 4;
+  uint8_t txbuf[flash_cmd_size] = {0x9f};
+  uint8_t rxbuf[flash_cmd_size] = {0};
+  flash_do_cmd(txbuf, rxbuf, flash_cmd_size);
+  return 1 << rxbuf[3];
+}
+
+#pragma pack(push, 1)
+struct Configuration {
+  struct Wifi {
+    const char ssid[33] = WIFI_SSID;
+    const char password[64] = WIFI_PASSWORD;
+    uint32_t auth = WIFI_AUTH;
+  };
+
+  Wifi wifi;
+  float setpoint = 0.0f;
+  uint8_t status = 0x00;
+};
+#pragma pack(pop)
+
 class MyDevice
     : public Master<PicoTimer, PicoSemaphore, PicoTime, PicoQueue, PicoIO> {
 public:
-  enum State { INIT, SLAVE_DATA, NORMAL };
+  enum State { INIT, SLAVE_INFO, NORMAL };
   State state = INIT;
 
-  MyDevice(const Pins &pins) : Master(pins), state(INIT) {}
+  MyDevice(const Pins &pins, const Configuration &configuration)
+      : Master(pins), state(INIT), configuration(configuration) {}
+
   virtual ~MyDevice() = default;
 
   Frame init_master_frames[2] = {Frame(ReadData, 0), Frame(ReadData, 3)};
 
-  Frame slave_data_frames[6] = {Frame(ReadData, 3),  Frame(ReadData, 125),
+  Frame slave_info_frames[6] = {Frame(ReadData, 3),  Frame(ReadData, 125),
                                 Frame(ReadData, 15), Frame(ReadData, 127),
                                 Frame(ReadData, 57), Frame(WriteData, 1, 0.0f)};
 
-  Frame master_frames[11] = {
-      Frame(ReadData, 0),  Frame(ReadData, 10),      Frame(ReadData, 17),
-      Frame(ReadData, 18), Frame(ReadData, 19),      Frame(ReadData, 25),
-      Frame(ReadData, 26), Frame(ReadData, 28),      Frame(ReadData, 33),
-      Frame(ReadData, 35), Frame(WriteData, 1, 0.0f)};
+  Frame master_frames[10] = {Frame(ReadData, 0),  Frame(ReadData, 10),
+                             Frame(ReadData, 17), Frame(ReadData, 18),
+                             Frame(ReadData, 19), Frame(ReadData, 25),
+                             Frame(ReadData, 27), Frame(ReadData, 28),
+                             Frame(ReadData, 35), Frame(WriteData, 1, 0.0f)};
 
   void advance() {
     switch (state) {
@@ -87,11 +128,11 @@ public:
       master_index =
           (master_index + 1) % (sizeof(init_master_frames) / sizeof(Frame));
       if (master_index == 0)
-        state = SLAVE_DATA;
+        state = SLAVE_INFO;
       break;
-    case SLAVE_DATA:
+    case SLAVE_INFO:
       master_index =
-          (master_index + 1) % (sizeof(slave_data_frames) / sizeof(Frame));
+          (master_index + 1) % (sizeof(slave_info_frames) / sizeof(Frame));
       if (master_index == 0)
         state = NORMAL;
       break;
@@ -109,8 +150,8 @@ public:
     case INIT:
       f = init_master_frames[master_index];
       break;
-    case SLAVE_DATA:
-      f = slave_data_frames[master_index];
+    case SLAVE_INFO:
+      f = slave_info_frames[master_index];
       break;
     case NORMAL:
       f = master_frames[master_index];
@@ -118,24 +159,20 @@ public:
 
     switch (f.id()) {
     case 0:
-      f = Frame(ReadData, f.id(), status, 0x00);
+      f = Frame(ReadData, f.id(), configuration.status, 0x00);
       break;
     case 1:
       if (state == NORMAL)
-        f = Frame(f.msg_type(), f.id(), current_setpoint);
+        f = Frame(f.msg_type(), f.id(), configuration.setpoint);
       break;
     }
 
     tx(f, true);
   }
 
-  void set_status(uint8_t x) { status = x; }
-  void set_setpoint(float x) { current_setpoint = x; }
-
 protected:
   size_t master_index = 0;
-  float current_setpoint = 0.0;
-  uint8_t status = 0;
+  const Configuration &configuration;
 };
 
 class MyApp : public RichApplication {
@@ -143,14 +180,12 @@ public:
   using RichApplication::idmeta;
 
   MyApp(const Pins &pins)
-      : RichApplication(device), device(pins),
+      : RichApplication(device), device(pins, configuration),
         mqtt_publish_queue(mqtt_max_concurrent_requests),
-        wifi_link_timer(0, 1000000, on_wifi_link_timer_cb, nullptr, this) {
+        wifi_link_timer(0, 1000000, on_wifi_link_timer_cb, nullptr, this),
+        pid(10.0, 10.0 / 50.0, 10.0 * 1.0, 0.0, 80.0),
+        pid_timer(0, 1000000, on_pid_timer_cb, nullptr, this) {
     device.set_frame_callback(Application::sprocess, this);
-
-    sconfig_smemberid = (uint16_t)0x0000;
-    ot_version_master = 2.2f;
-    ot_version_slave = 0.0f;
   }
 
   virtual ~MyApp() = default;
@@ -169,11 +204,61 @@ public:
     rx_forever();
   }
 
+  virtual bool process_command(const CommandFrame &cmd_frame) override {
+    char buf[CommandFrame::serialized_size()];
+    bool q = cmd_frame.to_string(buf, sizeof(buf));
+    llog("process_command: %s (%d)", buf, q);
+
+    switch (cmd_frame.command_id) {
+    case CommandID::OPENTHERM_REQUEST: {
+      RequestID rid = tx(
+          cmd_frame.payload, false,
+          [](Application *a, RequestStatus s, RequestID rid, const Frame &f) {
+            MyApp *app = static_cast<MyApp *>(a);
+            auto &req =
+                app->mqtt_cmd_requests[rid % mqtt_max_concurrent_requests];
+            if (req.rid != rid)
+              llog("warning: outdated MQTT request ID");
+            req.rid = NoRequestID;
+            app->mqtt_publish_cmd_response(s, req.user_data, f);
+            app->mqtt_num_active_cmd_requests--;
+          });
+
+      if (rid == NoRequestID) {
+        llog("error: failure to submit MQTT request (the queue is likely "
+             "full)");
+        return false;
+      } else {
+        mqtt_cmd_requests[rid % mqtt_max_concurrent_requests] = {
+            .rid = rid, .user_data = cmd_frame.user_data};
+        mqtt_num_active_cmd_requests++;
+        return true;
+      }
+      break;
+    }
+    case CommandID::INVALID: {
+      mqtt_publish_cmd_response(RequestStatus::SKIPPED, cmd_frame.user_data, 0);
+      return false;
+    }
+    case CommandID::SET_STATUS: {
+      configuration.status = cmd_frame.payload & 0x00FF;
+      return true;
+    }
+    case CommandID::SET_SETPOINT: {
+      float v = (cmd_frame.payload & 0x0000FFFF) / 256.0f;
+      llog("new setpoint: %.2f", v);
+      configuration.setpoint = v;
+      return true;
+    }
+    default:
+      return Application::process_command(cmd_frame);
+    }
+  }
+
   virtual void on_read_ack(uint8_t data_id, uint16_t data_value) override {
     ::llog("Read-Ack(%d, %04x)", data_id, data_value);
     RichApplication::on_read_ack(data_id, data_value);
-    slave_state[data_id].seen = true;
-    slave_state[data_id].value = data_value;
+    slave_id_infos[data_id].seen = true;
     device.advance();
 
     switch (data_id) {
@@ -189,20 +274,22 @@ public:
   virtual void on_write_ack(uint8_t data_id, uint16_t data_value) override {
     ::llog("Write-Ack(%d, %04x)", data_id, data_value);
     RichApplication::on_write_ack(data_id, data_value);
-    slave_state[data_id].seen = true;
-    slave_state[data_id].value = data_value;
+    slave_id_infos[data_id].seen = true;
     device.advance();
   }
 
   virtual void on_data_invalid(uint8_t data_id, uint16_t data_value) override {
     ::llog("Data-Invalid(%d, %04x)", data_id, data_value);
     RichApplication::on_data_invalid(data_id, data_value);
+    device.advance();
   }
 
   virtual void on_unknown_data_id(uint8_t data_id,
                                   uint16_t data_value) override {
     ::llog("Unknown-DataID(%d, %04x)", data_id, data_value);
     RichApplication::on_unknown_data_id(data_id, data_value);
+    slave_id_infos[data_id].unsupported = true;
+    device.advance();
   }
 
   virtual RequestID tx(const Frame &f, bool skip_if_busy = false,
@@ -231,12 +318,12 @@ public:
 
   void tx_forever() { device.tx_forever(); }
 
-  struct SlaveState {
+  struct SlaveIDInfo {
     bool seen = false;
-    uint16_t value = 0;
+    bool unsupported = false;
   };
 
-  SlaveState slave_state[256] = {{0}};
+  SlaveIDInfo slave_id_infos[256] = {{0}};
 
   size_t num_mqtt_reinit = 0;
 
@@ -245,6 +332,7 @@ public:
 
 protected:
   MyDevice device;
+  Configuration configuration;
 
   mqtt_client_t *mqtt_client = nullptr;
   struct mqtt_connect_client_info_t mqtt_client_info;
@@ -256,14 +344,15 @@ protected:
 
   struct MQTTRequest {
     RequestID rid = NoRequestID;
-    uint16_t user_id = 0;
+    uint16_t user_data = 0;
   };
 
   static constexpr const size_t mqtt_max_concurrent_requests = 16;
 
   MQTTRequest mqtt_cmd_requests[mqtt_max_concurrent_requests];
   size_t mqtt_num_active_cmd_requests = 0;
-  char mosq_cmd_hex[13 * mqtt_max_concurrent_requests];
+  char mosq_cmd_hex[CommandFrame::serialized_size() *
+                    mqtt_max_concurrent_requests];
   size_t mosq_data_arrived = 0;
 
   struct MQTTPublishRequest {
@@ -283,49 +372,62 @@ protected:
     MQTTPublishRequest req;
     req.topic = topic;
     req.length =
-        snprintf(req.payload, sizeof(req.payload), "%08lx", (uint32_t)f);
+        snprintf(req.payload, sizeof(req.payload), "%08" PRIx32, (uint32_t)f);
     mqtt_publish_queue_add(req);
   }
 
   void mqtt_publish_all_queued() {
-    if (!mqtt_client)
+    static volatile bool busy = false;
+
+    if (!mqtt_client || busy)
       return;
+
+    busy = true;
 
     MQTTPublishRequest req;
     while (mqtt_publish_queue.try_remove(req)) {
       if (!mqtt_client)
         mqtt_reinit();
 
-      bool retry = true;
-      while (retry) {
-        retry = false;
+      for (bool retry = true; retry;) {
+        mqtt_sem.acquire_blocking();
+#if LWIP_TCPIP_CORE_LOCKING
+        sys_mutex_lock(&lock_tcpip_core)
+#endif
+        {
+          int err = mqtt_publish(
+              mqtt_client, req.topic, req.payload, req.length, 0, 0,
+              [](void *arg, err_t err) {
+                if (err != ERR_OK && err != ERR_TIMEOUT)
+                  llog("mqtt_publish failed (callback): err=%d", err);
+                if (err != ERR_TIMEOUT) {
+#if LWIP_TCPIP_CORE_LOCKING
+                  sys_mutex_unlock(&lock_tcpip_core)
+#endif
+                      static_cast<PicoSemaphore *>(arg)
+                          ->release();
+                }
+              },
+              &mqtt_sem);
 
-        while (!mqtt_sem.acquire_timeout(25000)) {
-          llog("mqtt_sem timeout; forcing release of semaphore");
-          mqtt_sem.release();
+          if (err != ERR_OK) {
+            llog("mqtt_publish failed (call): err=%d", err);
+            mqtt_reinit();
+            retry = true;
+          } else if (!mqtt_sem.acquire_timeout(MQTT_REQ_TIMEOUT * 1e6)) {
+            llog("mqtt_publish failed (timeout)");
+            retry = true;
+          } else
+            retry = false;
         }
-
-        int err = mqtt_publish(
-            mqtt_client, req.topic, req.payload, req.length, 0, 0,
-            [](void *arg, err_t err) {
-              if (err != ERR_OK)
-                llog("mqtt_publish failed (callback): err=%d", err);
-              // retry?
-              static_cast<PicoSemaphore*>(arg)->release();
-            },
-            &mqtt_sem);
-        if (err != ERR_OK) {
-          llog("mqtt_publish failed (call): err=%d", err);
-          llog("lwIP stats: %lu %lu %lu %lu %lu", lwip_stats.mem.err,
-                lwip_stats.mem.avail, lwip_stats.mem.used, lwip_stats.mem.max,
-                lwip_stats.mem.illegal);
-          mqtt_reinit();
-          retry = true;
-          llog("retrying");
-          mqtt_sem.release();
-        }
+#if LWIP_TCPIP_CORE_LOCKING
+        sys_mutex_unlock(&lock_tcpip_core)
+#endif
+            mqtt_sem.release();
       }
     }
+
+    busy = false;
   }
 
   static void on_mqtt_publish_cb(void *arg, const char *topic, u32_t tot_len) {
@@ -345,76 +447,36 @@ protected:
   }
 
   void on_mqtt_data(const u8_t *data, u16_t len, u8_t flags) {
-    for (uint16_t i = 0; i < len && mosq_data_arrived < sizeof(mosq_cmd_hex);
-         i++) {
-      mosq_cmd_hex[mosq_data_arrived++] = data[i];
-      if (mosq_data_arrived >= 12) {
-        mosq_cmd_hex[mosq_data_arrived] = 0;
-        break;
-      }
-    }
-    while (mosq_data_arrived >= 12) {
-      uint16_t user_id = 0;
-      uint32_t req_msg = 0;
-      if (sscanf(mosq_cmd_hex, "%04hx%08lx", &user_id, &req_msg) != 2)
-        llog("error: invalid MQTT input; not a hex-encoded request ID and "
-             "OpenTherm frame");
-      else {
-        if (mqtt_num_active_cmd_requests >= mqtt_max_concurrent_requests)
-          llog("error: too many MQTT requests");
-        else {
-          RequestID rid = tx(
-              req_msg, false,
-              [](Application *a, RequestStatus s, RequestID rid,
-                 const Frame &f) {
-                MyApp *app = static_cast<MyApp *>(a);
-                auto &req =
-                    app->mqtt_cmd_requests[rid % mqtt_max_concurrent_requests];
-                if (req.rid != rid)
-                  llog("warning: outdated MQTT request ID");
-                else {
-                  req.rid = NoRequestID;
-                  app->mqtt_publish_cmd_response(s, req.user_id, f);
-                  app->mqtt_num_active_cmd_requests--;
-                }
-              });
+    static constexpr const size_t fsz = CommandFrame::serialized_size();
 
-          if (rid == NoRequestID)
-            llog("error: failure to submit MQTT request (the queue is likely "
-                 "full)");
-          else {
-            mqtt_cmd_requests[rid % mqtt_max_concurrent_requests] = {
-                .rid = rid, .user_id = user_id};
-            mqtt_num_active_cmd_requests++;
-          }
+    for (uint16_t i = 0; i < len && mosq_data_arrived < sizeof(mosq_cmd_hex);)
+      mosq_cmd_hex[mosq_data_arrived++] = data[i++];
 
-          Frame f(req_msg);
-          switch (f.id()) {
-          case 2: {
-            device.set_status(f.data_byte_1());
-            break;
-          }
-          case 1: {
-            float v = (req_msg & 0x0000FFFF) / 256.0f;
-            llog("new setpoint: %.2f", v);
-            device.set_setpoint(v);
-          }
-          }
-        }
-      }
+    if (flags & MQTT_DATA_FLAG_LAST) {
+      if (mosq_data_arrived >= fsz) {
+        CommandFrame cf(mosq_cmd_hex, mosq_data_arrived);
+        if (!process_command(cf))
+          llog("command processing failed for command frame '%s'",
+               mosq_cmd_hex);
+      } else
+        llog("dropping command frame of size %lu: %s", mosq_data_arrived,
+             mosq_cmd_hex);
 
-      for (size_t i = 0; i < 12 && i + 12 < sizeof(mosq_cmd_hex); i++)
-        mosq_cmd_hex[i] = mosq_cmd_hex[i + 12];
-      mosq_data_arrived -= 12;
+      for (size_t i = 0; i < fsz && i + fsz < sizeof(mosq_cmd_hex); i++)
+        mosq_cmd_hex[i] = mosq_cmd_hex[i + fsz];
+      mosq_data_arrived -= fsz;
     }
   }
 
   void mqtt_publish_cmd_response(RequestStatus s, uint16_t user_id,
                                  const Frame &f) {
+    CommandFrame cf(CommandID::OPENTHERM_REPLY, user_id, (uint32_t)f);
+
     MQTTPublishRequest req;
     req.topic = mqtt_cmd_out_topic;
-    req.length = snprintf(req.payload, sizeof(req.payload), "%04x%08lx",
-                          user_id, (uint32_t)f);
+    if (!cf.to_string(req.payload, sizeof(req.payload)))
+      snprintf(req.payload, sizeof(req.payload), "00%04x00000000", user_id);
+    req.length = cf.serialized_size();
     mqtt_publish_queue_add(req);
   }
 
@@ -427,9 +489,6 @@ protected:
   void on_mqtt_connection(mqtt_client_t *client,
                           mqtt_connection_status_t status) {
     llog("MQTT connection status: %d", status);
-    // if (status == MQTT_CONNECT_DISCONNECTED || status ==
-    // MQTT_CONNECT_TIMEOUT)
-    //   mqtt_reinit();
   }
 
   void mqtt_reinit() {
@@ -466,9 +525,8 @@ protected:
       return;
     }
 
-    err_t r =
-        mqtt_client_connect(mqtt_client, &ip, port, on_mqtt_connection_cb,
-                            this, &mqtt_client_info);
+    err_t r = mqtt_client_connect(mqtt_client, &ip, port, on_mqtt_connection_cb,
+                                  this, &mqtt_client_info);
     if (r != ERR_OK) {
       llog("mqtt_client_connect failed: %d", r);
       return;
@@ -504,7 +562,9 @@ protected:
     if (wifi_link_down)
       llog("Wifi link status: wifi=%d tcpip=%d", ws, ts);
     if (ws <= 0) {
-      ws = cyw43_arch_wifi_connect_async(WIFI_SSID, WIFI_PASSWORD, WIFI_AUTH);
+      ws = cyw43_arch_wifi_connect_async(configuration.wifi.ssid,
+                                         configuration.wifi.password,
+                                         configuration.wifi.auth);
       wifi_link_down = true;
     }
     if (wifi_link_down && ts == CYW43_LINK_UP) {
@@ -521,19 +581,32 @@ protected:
       return false;
     }
 
-    llog("Connecting to '%s'", WIFI_SSID);
+    llog("Connecting to '%s'", configuration.wifi.ssid);
     cyw43_wifi_pm(&cyw43_state, CYW43_AGGRESSIVE_PM);
     cyw43_arch_enable_sta_mode();
     wifi_link_timer.start();
 
     return true;
   }
+
+  PIDController<PicoTime> pid;
+  PicoTimer pid_timer;
+
+  static bool on_pid_timer_cb(Timer *timer, void *obj) {
+    MyApp *app = static_cast<MyApp *>(obj);
+    return app->on_pid_timer(timer);
+  };
+
+  bool on_pid_timer(Timer *) {
+    pid.update(0.0);
+    return true;
+  };
 };
 
 MyApp app({.rx = 27, .tx = 26, .owned = true});
 
 extern "C" {
-#define MAX_RESPONSE_SIZE 5 * 1024
+#define MAX_RESPONSE_SIZE 6 * 1024
 
 struct FSCustomData {
   uint64_t request_id = -1;
@@ -550,8 +623,8 @@ static int make_http_response(char *state, FSCustomData *data) {
     Frame response;
     switch (app.dev().get(data->request_id, response)) {
     case RequestStatus::OK:
-      sz =
-          snprintf(data->lbuf, sizeof(data->lbuf), "%08lx", (uint32_t)response);
+      sz = snprintf(data->lbuf, sizeof(data->lbuf), "%08" PRIx32,
+                    (uint32_t)response);
       status = "200";
       break;
     case RequestStatus::TIMED_OUT:
@@ -600,14 +673,16 @@ size_t make_status_page(char *buf, size_t sz) {
                 "<tr><th>Data "
                 "ID</th><th>Raw</th><th>Value</th><th>Description</th></tr>");
   for (size_t i = 0; i < 256; i++)
-    if (app.slave_state[i].seen)
-      p += snprintf(
-          PSZ,
-          "<tr><td>%u</td><td>%04x</td><td>%s</td><td id=\"txt\">%s</td</tr>",
-          i, app.slave_state[i].value,
-          Application::ID::to_string(app.idmeta[i].type,
-                                     app.slave_state[i].value),
-          app.idmeta[i].description);
+    if (app.slave_id_infos[i].seen) {
+      const auto *id = app.find(i);
+      if (id)
+        p += snprintf(
+            PSZ,
+            "<tr><td>%u</td><td>%04x</td><td>%s</td><td id=\"txt\">%s</td</tr>",
+            i, id->value,
+            Application::ID::to_string(app.idmeta[i].type, id->value),
+            app.idmeta[i].description);
+    }
   p += snprintf(PSZ, "</table>");
 
   p += snprintf(PSZ, "<h2>lwIP memory statistics</h2>");
@@ -644,9 +719,10 @@ int fs_open_custom(struct fs_file *file, const char *name) {
     file->index = 0;
 
     auto data = (FSCustomData *)mem_malloc(sizeof(FSCustomData));
-    if (!data)
-      llog("file state allocation failure");
-    else {
+    if (!data) {
+      llog("file data allocation failure");
+      return 0;
+    } else {
       data->request_id = NoRequestID;
       data->status = NULL;
       data->lbuf_sz = 0;
@@ -723,7 +799,7 @@ void httpd_cgi_handler(struct fs_file *file, const char *uri, int num_params,
           if (strcmp(keys[i], "msg") == 0) {
             uint32_t msg = 0;
             found_msg = true;
-            if (sscanf(values[i], "%08lx", &msg) != 1) {
+            if (sscanf(values[i], "%08" SCNx32, &msg) != 1) {
               data->lbuf_sz =
                   snprintf(data->lbuf, sizeof(data->lbuf),
                            "'%s' is not a hex-encoded uint32_t", values[i]);
@@ -781,23 +857,19 @@ int main() {
   stdio_init_all();
   sleep_ms(1000);
 
-  llog("OpenThermOstat starting...");
+  llog("Controller starting...");
+
+  llog("RP2040 chip version %u, rom version %u", rp2040_chip_version(),
+       rp2040_rom_version());
 
   char board_id[2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1];
   pico_get_unique_board_id_string(board_id, sizeof(board_id));
   llog("Board ID: %s", board_id);
 
-  stats_init();
-
-  // clocks_init();
-  // uint vco = PICO_PLL_VCO_MIN_FREQ_MHZ * 1e6, pd1=7, pd2=7;
-  // uint vco = 1000 * 1e6, pd1 = 4, pd2 = 4;
-  // check_sys_clock_khz(20000, &vco, &pd1, &pd2);
-  // if (check_sys_clock_khz(20000, &vco, &pd1, &pd2))
-  // set_sys_clock_pll(vco, pd1, pd2);
-
+  llog("Flash size: %llu bytes", flash_size());
   llog("Running at %.2f MHz", clock_get_hz(clk_sys) / 1e6);
-  // llog("(vco=%d pd1=%d pd2=%d)", vco, pd1, pd2);
+
+  stats_init();
 
   multicore_reset_core1();
   multicore_launch_core1(core1_main);

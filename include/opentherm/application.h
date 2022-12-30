@@ -1,6 +1,7 @@
 #ifndef _OPENTHERM_DATA_H_
 #define _OPENTHERM_DATA_H_
 
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -9,6 +10,50 @@
 // OpenTherm 2.2 application layer
 
 namespace OpenTherm {
+
+enum class CommandID : uint8_t {
+  INVALID = 0,
+  OPENTHERM_REQUEST = 1,
+  OPENTHERM_REPLY = 2,
+  SET_STATUS = 3,
+  SET_SETPOINT = 4
+};
+
+#pragma pack(push, 1)
+class CommandFrame {
+public:
+  CommandFrame(CommandID cid, uint16_t user_data, uint32_t payload)
+      : command_id(cid), user_data(user_data), payload(payload) {}
+
+  CommandFrame(CommandID cid, uint16_t user_data, const Frame &f)
+      : command_id(cid), user_data(user_data), payload(f) {}
+
+  CommandFrame(const char *buffer, size_t size) {
+    uint16_t cid, ud; // Some toolchains don't like/support SCNx8
+    uint32_t pl;
+    if (sscanf(buffer, "%02" SCNx16 "%04" SCNx16 "%08" SCNx32, &cid, &ud,
+               &pl) == 3) {
+      command_id = static_cast<CommandID>(cid & 0x00FF);
+      user_data = ud;
+      payload = pl;
+    } else
+      command_id = CommandID::INVALID;
+  }
+
+  virtual ~CommandFrame() = default;
+
+  CommandID command_id = CommandID::OPENTHERM_REQUEST;
+  uint16_t user_data = 0;
+  uint32_t payload = 0;
+
+  int to_string(char *buffer, size_t size) const {
+    return snprintf(buffer, size, "%02" PRIx8 "%04" PRIx16 "%08" PRIx32,
+                    static_cast<uint8_t>(command_id), user_data, payload);
+  }
+
+  static constexpr const size_t serialized_size() { return 14 + 1; }
+};
+#pragma pack(pop)
 
 class Application {
 public:
@@ -116,16 +161,24 @@ public:
 
   virtual void run() = 0;
 
+  virtual bool process_command(const CommandFrame &cmd_frame) {
+    switch (cmd_frame.command_id) {
+    case CommandID::OPENTHERM_REQUEST:
+      return device.tx(Frame(cmd_frame.payload));
+    default:
+      return false;
+    }
+  }
+
 protected:
   DeviceBase &device;
 
-  IDIndex index[59];
+  IDIndex index[61];
   size_t index_size;
 
   IDMeta *idmeta = nullptr;
 
 public:
-
 #define DID(NR, MSG, FNAME, OBJECT, TYPE, DESC)                                \
   ID FNAME = ID(NR, MSG, OBJECT, TYPE, DESC, index, index_size, idmeta);
 
@@ -174,7 +227,7 @@ public:
   DID( 56, RW, tdhwset, "TdhwSet", F88, "DHW setpoint (&deg;C) (Remote parameter 1)");
   DID( 57, RW, maxtset, "MaxTSet", F88, "Max CH water setpoint (&deg;C) (Remote parameters 2)");
   DID( 58, RW, hcratio, "Hcratio", F88, "OTC heat curve ratio (&deg;C) (Remote parameter 3)");
-  DID(100, RO, remote_override, "Remote override function", flag8_, "Function of manual and program changes in master and remoteroom setpoint");
+  DID(100, RO, remote_override, "Remote override function", flag8_, "Function of manual and program changes in master and remote room setpoint");
   DID(115, RO, oem_diagnostic_code, "OEM diagnostic code", u16, "OEM-specific diagnostic/service code");
   DID(116, RW, burner_starts, "Burner starts", u16, "Number of starts burner");
   DID(117, RW, ch_pump_starts, "CH pump starts", u16, "Number of starts CH pump");
@@ -191,9 +244,13 @@ public:
 
   DID( 34, RO, theatex, "Theatex", F88, "Boiler heat exchanger temperature (&deg;C)");
   DID( 35, RW, boiler_fan_speed, "Boiler fan speed", u8_u8, "Boiler fan speed setpoint and actual value");
-  DID( 36, RO, burner_flame_current, "Burner flame current", s16, "Electrical current through burner flame [µA]");
+  DID( 36, RO, burner_flame_current, "Burner flame current", s16, "Electrical current through burner flame (&micro;A)");
   DID( 37, WO, tr2, "Tr2", F88, "Room temperature for 2nd CH circuit (&deg;C)");
-  DID( 38, RW, humidity, "Humidity", s16, "Relative Humidity");
+  DID( 38, RW, humidity, "Humidity", s16, "Relative Humidity (%)");
+  DID( 99, RW, operating_mode, "Operating mode", u16, "Operating mode HC1/HC2/DHW");
+  DID(113, RW, burner_nonstarts, "Burner non-starts", u16, "Number of unsuccessful burner starts");
+  DID(114, RW, flame_low, "Flame low", u16, "Number of times flame signal was too low");
+
   // clang-format on
 
   virtual bool process(const Frame &f) {
@@ -225,7 +282,6 @@ public:
   }
 
 protected:
-
   virtual ID *find(uint8_t id) {
     for (auto d : index)
       if (d.id == id)
@@ -263,9 +319,20 @@ protected:
   }
 
   // Slave to Master
-  virtual void on_read_ack(uint8_t data_id, uint16_t data_value) {}
-  virtual void on_write_ack(uint8_t data_id, uint16_t data_value) {}
+  virtual void on_read_ack(uint8_t data_id, uint16_t data_value) {
+    ID *id = find(data_id);
+    if (id)
+      id->value = data_value;
+  }
+
+  virtual void on_write_ack(uint8_t data_id, uint16_t data_value) {
+    ID *id = find(data_id);
+    if (id)
+      id->value = data_value;
+  }
+
   virtual void on_data_invalid(uint8_t data_id, uint16_t data_value) {}
+
   virtual void on_unknown_data_id(uint8_t data_id, uint16_t data_value) {}
 
   static bool sprocess(Application &app, const Frame &f) {
@@ -279,9 +346,7 @@ public:
 
   virtual ~RichApplication() = default;
 
-  virtual ID *find(uint8_t id) override {
-    return &index[id];
-  }
+  virtual ID *find(uint8_t id) override { return &index[id]; }
 
 protected:
   ID index[256];

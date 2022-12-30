@@ -27,6 +27,7 @@ target_include_directories(openthermostat PRIVATE ${CMAKE_CURRENT_LIST_DIR} ${CM
 target_link_libraries(openthermostat PRIVATE
   pico_stdlib
   pico_multicore
+  pico_platform
   hardware_adc
   hardware_pio
   hardware_flash

@@ -35,7 +35,7 @@ public:
   MyApp() : Application(device) {
     device.set_frame_callback(Application::sprocess, this);
 
-    const char* cs = std::getenv("PQCONNECTION");
+    const char *cs = std::getenv("PQCONNECTION");
 
     if (!cs)
       throw std::runtime_error("no connection string");
@@ -145,28 +145,21 @@ static const char *mosq_topic = "OpenThermOstat/#";
 
 void mosquitto_on_msg(mosquitto *mosq, void *arg,
                       const mosquitto_message *msg) {
+  static constexpr const size_t fsz = CommandFrame::serialized_size();
   const std::lock_guard<std::mutex> lock(log_mtx);
   if (msg->payloadlen == 8) {
     uint32_t otmsg = 0;
-    if (sscanf((char *)msg->payload, "%08x", &otmsg) != 1)
+    if (sscanf((char *)msg->payload, "%08" SCNx32, &otmsg) != 1)
       std::cout << "erroneous message: not an OpenTherm frame" << std::endl;
     else {
       Frame f(otmsg);
       std::cout << "\r> " << f.to_string() << std::endl;
       app.process(f);
     }
-  } else if (msg->payloadlen == 12) {
-    uint32_t otmsg = 0;
-    uint16_t rid = 0;
-    if (sscanf((char *)msg->payload, "%04hx%08x", &rid, &otmsg) != 2)
-      std::cout << "erroneous message: not an RID + OpenTherm frame"
-                << std::endl;
-    else {
-      Frame f(otmsg);
-      std::cout << "\r> " << rid << ": " << f.to_string() << std::endl;
-      // We don't log commands/replies.
-      // app.process(f);
-    }
+  } else if (msg->payloadlen == fsz) {
+    CommandFrame cmd_frame(static_cast<const char*>(msg->payload), msg->payloadlen);
+    std::cout << "\r> command frame " << msg->payload << std::endl;
+    // We don't log commands/replies.
   } else
     std::cout << "unknown message of length " << msg->payloadlen << std::endl;
 }
@@ -198,8 +191,8 @@ void mosquitto_init() {
     }
   });
 
-  const char* user = std::getenv("MQTT_USER");
-  const char* password = std::getenv("MQTT_PASS");
+  const char *user = std::getenv("MQTT_USER");
+  const char *password = std::getenv("MQTT_PASS");
 
   if (!user || !password)
     throw std::runtime_error("missing MQTT auth settings");
